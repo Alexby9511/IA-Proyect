@@ -1,0 +1,2266 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+adaptive_segmentation.py
+dataset_generator.py
+dataset_synthetic.py
+embeddings.py
+llm_evaluator.py
+Orientación.md
+requirements.txt
+simulated_annealing.py
+tune_expansion.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".gitignore">
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+env/
+venv/
+*.pyc
+dataset_synthetic.json
+dataset.json
+models/
+</file>
+
+<file path="adaptive_segmentation.py">
+"""
+adaptive_segmentation.py
+-----------------------
+Segmentacion optima de contenido basada en embeddings locales,
+umbral adaptativo con GMM y validacion puntual con LLM
+en todas las fronteras.
+
+Mejoras implementadas:
+  - bic_delta adaptativo segun longitud del texto
+  - Suavizado del perfil de similitud antes del GMM
+  - Fallback a minimos locales cuando GMM no encuentra dos modos
+  - Post-fusion de segmentos adyacentes similares (reduce K)
+  - F1 con tolerancia de ±1 posicion
+  - Cohesion corregida (centroide por segmento, no global)
+
+Uso:
+  python adaptive_segmentation.py --dataset dataset.json --index 0
+  python adaptive_segmentation.py --text-file texto.txt
+
+Requisitos:
+  pip install sentence-transformers scikit-learn python-dotenv cerebras-cloud-sdk
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from sklearn.mixture import GaussianMixture
+
+from embeddings import MODEL_A, MODEL_B, compute_embeddings, compute_similarity_profile, cosine_similarity
+
+# ---------------------------------------------------------------------------
+# Tokenizacion de oraciones (sin dependencias externas)
+# ---------------------------------------------------------------------------
+
+def split_sentences(text: str) -> list[str]:
+    """Divide texto en oraciones usando regex. Sin dependencias externas."""
+    text = re.sub(r"\s+", " ", text.strip())
+    pattern = r"(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑÜ])"
+    parts = re.split(pattern, text)
+    return [s.strip() for s in parts if len(s.split()) >= 5]
+
+
+# ---------------------------------------------------------------------------
+# Suavizado del perfil de similitud
+# ---------------------------------------------------------------------------
+
+def smooth_profile(similarities: list[float], window: int = 3) -> list[float]:
+    """
+    Aplica una media movil al perfil de similitud para reducir ruido local.
+    Reduce falsos positivos causados por oraciones de transicion individuales.
+    """
+    if len(similarities) < window:
+        return similarities
+    kernel = np.ones(window) / window
+    smoothed = np.convolve(similarities, kernel, mode="same")
+    # Preservar bordes sin suavizar (evitar artefactos)
+    smoothed[0] = similarities[0]
+    smoothed[-1] = similarities[-1]
+    return smoothed.tolist()
+
+
+# ---------------------------------------------------------------------------
+# Umbral adaptativo con GMM
+# ---------------------------------------------------------------------------
+
+def _gaussian_intersection(
+    w1: float, mu1: float, var1: float,
+    w2: float, mu2: float, var2: float,
+) -> float:
+    """Punto de interseccion entre dos gaussianas ponderadas."""
+    a = 1.0 / (2.0 * var2) - 1.0 / (2.0 * var1)
+    b = mu1 / var1 - mu2 / var2
+    c = (mu2 ** 2) / (2.0 * var2) - (mu1 ** 2) / (2.0 * var1)
+    c += math.log((w2 * math.sqrt(var1)) / (w1 * math.sqrt(var2) + 1e-12) + 1e-12)
+
+    if abs(a) < 1e-12:
+        return -c / b if abs(b) > 1e-12 else (mu1 + mu2) / 2.0
+
+    disc = b ** 2 - 4.0 * a * c
+    if disc < 0:
+        return (mu1 + mu2) / 2.0
+
+    sqrt_disc = math.sqrt(disc)
+    r1 = (-b + sqrt_disc) / (2.0 * a)
+    r2 = (-b - sqrt_disc) / (2.0 * a)
+    lo, hi = sorted([mu1, mu2])
+    mid = (lo + hi) / 2.0
+    for r in (r1, r2):
+        if lo <= r <= hi:
+            return r
+    return r1 if abs(r1 - mid) < abs(r2 - mid) else r2
+
+
+def _local_minima_threshold(similarities: list[float], percentile: float = 20.0) -> float:
+    """
+    Fallback cuando GMM no encuentra dos modos.
+    Usa el percentil bajo de las similitudes como umbral.
+    Mas agresivo que percentil 1 para capturar mas cortes candidatos.
+    """
+    return float(np.percentile(similarities, percentile))
+
+
+def compute_adaptive_threshold(
+    similarities: list[float],
+    n_sentences: int,
+) -> dict[str, Any]:
+    """
+    Calcula umbral T usando GMM con bic_delta adaptativo.
+
+    bic_delta se escala con el numero de oraciones:
+      - Textos cortos (<20):  delta pequeno (5) → mas sensible
+      - Textos medios (20-60): delta medio (10)
+      - Textos largos (>60):  delta grande (15) → mas estricto
+
+    Si GMM no encuentra dos modos, usa percentil 20 como fallback
+    en vez de percentil 1 (mas agresivo, captura mas candidatos).
+    """
+    if len(similarities) < 2:
+        return {"threshold": 0.0, "mode": "empty", "bic_1": None, "bic_2": None}
+
+    # bic_delta adaptativo
+    if n_sentences < 20:
+        bic_delta = 5.0
+    elif n_sentences < 60:
+        bic_delta = 10.0
+    else:
+        bic_delta = 15.0
+
+    X = np.array(similarities, dtype=float).reshape(-1, 1)
+
+    # Ejecutar GMM varias veces y tomar mediana del umbral (mas estable)
+    thresholds_gmm2 = []
+    bic1_vals, bic2_vals = [], []
+
+    for seed in range(5):
+        gmm1 = GaussianMixture(n_components=1, random_state=seed)
+        gmm2 = GaussianMixture(n_components=2, random_state=seed)
+        gmm1.fit(X)
+        gmm2.fit(X)
+
+        bic1_vals.append(gmm1.bic(X))
+        bic2_vals.append(gmm2.bic(X))
+
+        if gmm2.bic(X) < gmm1.bic(X) - bic_delta:
+            means = gmm2.means_.ravel()
+            covs  = gmm2.covariances_.ravel()
+            weights = gmm2.weights_.ravel()
+            change_idx = int(np.argmin(means))
+            same_idx   = 1 - change_idx
+            t = _gaussian_intersection(
+                weights[same_idx], means[same_idx], covs[same_idx],
+                weights[change_idx], means[change_idx], covs[change_idx],
+            )
+            thresholds_gmm2.append(t)
+
+    bic1 = float(np.mean(bic1_vals))
+    bic2 = float(np.mean(bic2_vals))
+
+    if thresholds_gmm2:
+        threshold = float(np.median(thresholds_gmm2))
+        return {"threshold": threshold, "mode": "gmm2", "bic_1": bic1, "bic_2": bic2}
+
+    # Fallback: percentil 20 (mas agresivo que el anterior percentil 1)
+    threshold = _local_minima_threshold(similarities, percentile=20.0)
+    return {"threshold": threshold, "mode": "gmm1_fallback", "bic_1": bic1, "bic_2": bic2}
+
+
+# ---------------------------------------------------------------------------
+# Cohesion interna de segmentos (corregida)
+# ---------------------------------------------------------------------------
+
+def segment_cohesion(embeddings: np.ndarray, start: int, end: int) -> float:
+    """
+    Cohesion interna de un segmento: similitud coseno promedio
+    entre cada oracion y el centroide DEL SEGMENTO (no global).
+    Rango: 0.0 (incoherente) a 1.0 (perfectamente cohesionado).
+    """
+    block = embeddings[start:end]
+    if len(block) == 0:
+        return 0.0
+    if len(block) == 1:
+        return 1.0  # un solo elemento es trivialmente cohesionado
+    centroid = block.mean(axis=0)
+    sims = [cosine_similarity(emb, centroid) for emb in block]
+    return float(np.mean(sims))
+
+
+# ---------------------------------------------------------------------------
+# Post-fusion de segmentos adyacentes similares
+# ---------------------------------------------------------------------------
+
+def merge_similar_segments(
+    cuts: list[int],
+    embeddings: np.ndarray,
+    n: int,
+    merge_threshold: float = 0.90,
+) -> list[int]:
+    """
+    Fusiona pares de segmentos adyacentes cuyo centroide es muy similar.
+    Reduce K sin sacrificar cohesion — ataca directamente el objetivo
+    de K minimo.
+
+    merge_threshold: similitud minima entre centroides para fusionar.
+    Valor alto (0.90) = solo fusiona si son casi identicos.
+    """
+    if not cuts:
+        return cuts
+
+    boundaries = [0] + sorted(cuts) + [n]
+    changed = True
+
+    while changed and len(boundaries) > 2:
+        changed = False
+        new_boundaries = [boundaries[0]]
+
+        i = 0
+        while i < len(boundaries) - 1:
+            start = boundaries[i]
+            end   = boundaries[i + 1]
+
+            if i + 1 < len(boundaries) - 1:
+                next_end = boundaries[i + 2]
+                c1 = embeddings[start:end].mean(axis=0)
+                c2 = embeddings[end:next_end].mean(axis=0)
+                sim = cosine_similarity(c1, c2)
+
+                if sim >= merge_threshold:
+                    # Fusionar: saltar el corte entre i e i+1
+                    new_boundaries.append(next_end)
+                    i += 2
+                    changed = True
+                    continue
+
+            new_boundaries.append(end)
+            i += 1
+
+        boundaries = new_boundaries
+
+    return sorted([b for b in boundaries if 0 < b < n])
+
+
+# ---------------------------------------------------------------------------
+# Construccion de segmentos
+# ---------------------------------------------------------------------------
+
+def build_segments(sentences: list[str], cuts: list[int]) -> list[list[str]]:
+    n = len(sentences)
+    boundaries = [0] + sorted(cuts) + [n]
+    return [sentences[boundaries[i]:boundaries[i + 1]] for i in range(len(boundaries) - 1)]
+
+
+# ---------------------------------------------------------------------------
+# Evaluacion F1 con tolerancia
+# ---------------------------------------------------------------------------
+
+def compute_f1(
+    predicted: list[int],
+    ground_truth: list[int],
+    tolerance: int = 1,
+) -> tuple[float, float, float]:
+    """
+    Calcula F1, precision y recall con tolerancia de ±tolerance posiciones.
+    Un corte predicho cuenta como correcto si hay un corte real
+    a distancia <= tolerance.
+
+    tolerance=1 significa que un corte en posicion 9 cuando el real
+    es 8 cuenta como correcto — razonable dado el ruido del tokenizador.
+    """
+    if not ground_truth and not predicted:
+        return 1.0, 1.0, 1.0
+    if not ground_truth or not predicted:
+        return 0.0, 0.0, 0.0
+
+    gt_matched   = set()
+    pred_matched = set()
+
+    for i, p in enumerate(predicted):
+        for j, g in enumerate(ground_truth):
+            if abs(p - g) <= tolerance and j not in gt_matched:
+                gt_matched.add(j)
+                pred_matched.add(i)
+                break
+
+    tp        = len(pred_matched)
+    precision = tp / len(predicted)    if predicted    else 0.0
+    recall    = tp / len(ground_truth) if ground_truth else 0.0
+    f1        = (2 * precision * recall / (precision + recall)
+                 if (precision + recall) > 0 else 0.0)
+    return f1, precision, recall
+
+
+# ---------------------------------------------------------------------------
+# Pipeline principal
+# ---------------------------------------------------------------------------
+
+def segment_sentences(
+    sentences: list[str],
+    model_path: str = MODEL_A,
+    merge_threshold: float = 0.90,
+    smooth_window: int = 3,
+) -> dict[str, Any]:
+    """
+    Pipeline completo de segmentacion adaptativa.
+
+    1. Calcular embeddings
+    2. Calcular perfil de similitud y suavizarlo
+    3. GMM con bic_delta adaptativo → umbral T
+    4. Detectar cortes candidatos donde similitud < T
+    5. Validar cada corte candidato con LLM (judge_boundary)
+    6. Post-fusion de segmentos adyacentes similares
+    7. Calcular cohesion final por segmento
+
+    Retorna dict con cortes, segmentos, metricas y estadisticas.
+    """
+    n = len(sentences)
+
+    if n < 2:
+        return {
+            "cuts": [], "segments": [sentences],
+            "threshold": 0.0, "mode": "short",
+            "cohesion_mean": 1.0, "llm_calls": 0,
+            "n_sentences": n,
+        }
+
+    # 1. Embeddings
+    embeddings = compute_embeddings(sentences, model_path)
+
+    # 2. Perfil de similitud + suavizado
+    raw_similarities  = compute_similarity_profile(embeddings)
+    similarities       = smooth_profile(raw_similarities, window=smooth_window)
+
+    # 3. Umbral adaptativo
+    gmm_info  = compute_adaptive_threshold(similarities, n_sentences=n)
+    threshold = gmm_info["threshold"]
+
+    # 4. Cortes candidatos
+    candidates = [i + 1 for i, sim in enumerate(similarities) if sim < threshold]
+
+    # 5. Validacion con LLM
+    llm_calls = 0
+    if candidates:
+        from llm_evaluator import judge_boundary
+        validated = []
+        for cut in candidates:
+            llm_calls += 1
+            if judge_boundary(sentences, cut, window=3):
+                validated.append(cut)
+        cuts = validated
+    else:
+        cuts = []
+
+    # 6. Post-fusion de segmentos similares (reduce K)
+    cuts = merge_similar_segments(cuts, embeddings, n, merge_threshold=merge_threshold)
+
+    # 7. Cohesion final por segmento
+    boundaries = [0] + cuts + [n]
+    seg_cohesions = [
+        segment_cohesion(embeddings, boundaries[i], boundaries[i + 1])
+        for i in range(len(boundaries) - 1)
+    ]
+    cohesion_mean = float(np.mean(seg_cohesions)) if seg_cohesions else 0.0
+
+    return {
+        "cuts":          cuts,
+        "segments":      build_segments(sentences, cuts),
+        "threshold":     threshold,
+        "mode":          gmm_info["mode"],
+        "bic_1":         gmm_info["bic_1"],
+        "bic_2":         gmm_info["bic_2"],
+        "cohesion_mean": cohesion_mean,
+        "seg_cohesions": seg_cohesions,
+        "llm_calls":     llm_calls,
+        "n_sentences":   n,
+        "n_candidates":  len(candidates),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def load_instance(dataset_path: Path, index: int) -> dict:
+    with dataset_path.open(encoding="utf-8") as f:
+        dataset = json.load(f)
+    if index < 0 or index >= len(dataset):
+        raise IndexError(f"Index {index} fuera de rango (dataset tiene {len(dataset)} instancias).")
+    return dataset[index]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Segmentacion adaptativa con embeddings + GMM + LLM puntual",
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--dataset",   type=Path, help="Ruta a dataset.json")
+    group.add_argument("--text-file", type=Path, help="Ruta a un .txt")
+
+    parser.add_argument("--index",  type=int,   default=0,      help="Indice de instancia en el dataset")
+    parser.add_argument("--model",  type=str,   default=MODEL_B, help="Ruta al modelo de embeddings")
+    parser.add_argument("--merge-threshold", type=float, default=0.90,
+                        help="Umbral de similitud para fusionar segmentos adyacentes (default: 0.90)")
+    parser.add_argument("--smooth-window",   type=int,   default=3,
+                        help="Tamano de ventana para suavizado del perfil (default: 3)")
+    parser.add_argument("--output", type=Path, help="Ruta para guardar resultado en JSON")
+
+    args = parser.parse_args()
+
+    # Cargar instancia
+    if args.dataset:
+        instance  = load_instance(args.dataset, args.index)
+        sentences = instance["sentences"]
+        gt_cuts   = instance.get("ground_truth_cuts", [])
+        title     = instance.get("title", f"instancia_{args.index}")
+    else:
+        text      = args.text_file.read_text(encoding="utf-8")
+        sentences = split_sentences(text)
+        gt_cuts   = []
+        title     = args.text_file.name
+
+    # Ejecutar pipeline
+    result = segment_sentences(
+        sentences,
+        model_path       = args.model,
+        merge_threshold  = args.merge_threshold,
+        smooth_window    = args.smooth_window,
+    )
+
+    # Mostrar resultados
+    print("=" * 62)
+    print("SEGMENTACION ADAPTATIVA")
+    print("=" * 62)
+    print(f"Instancia        : {title}")
+    print(f"Oraciones        : {result['n_sentences']}")
+    print(f"Modo GMM         : {result['mode']}")
+    print(f"Umbral T         : {result['threshold']:.4f}")
+    print(f"Candidatos LLM   : {result['n_candidates']}")
+    print(f"Llamadas LLM     : {result['llm_calls']}")
+    print(f"Cortes finales   : {result['cuts']}")
+    print(f"K encontrado     : {len(result['cuts']) + 1}")
+    print(f"Cohesion media   : {result['cohesion_mean']:.4f}")
+    print(f"Cohesion x seg.  : {[f'{c:.3f}' for c in result['seg_cohesions']]}")
+
+    if gt_cuts:
+        f1, p, r = compute_f1(result["cuts"], gt_cuts, tolerance=1)
+        print(f"\nGround truth     : {gt_cuts}")
+        print(f"K real           : {len(gt_cuts) + 1}")
+        print(f"F1 (tol=±1)      : {f1:.3f} | P: {p:.3f} | R: {r:.3f}")
+        exact_f1, ep, er = compute_f1(result["cuts"], gt_cuts, tolerance=0)
+        print(f"F1 (exacto)      : {exact_f1:.3f} | P: {ep:.3f} | R: {er:.3f}")
+
+    # Mostrar segmentos
+    print(f"\n{'─'*62}")
+    print("SEGMENTOS ENCONTRADOS")
+    print(f"{'─'*62}")
+    for i, seg in enumerate(result["segments"]):
+        coh = result["seg_cohesions"][i]
+        print(f"\nSegmento {i+1} ({len(seg)} oraciones | cohesion={coh:.3f})")
+        for sent in seg:
+            print(f"  • {sent[:90]}")
+
+    # Guardar JSON si se pide
+    if args.output:
+        payload = {
+            "title":         title,
+            "cuts":          result["cuts"],
+            "K":             len(result["cuts"]) + 1,
+            "threshold":     result["threshold"],
+            "mode":          result["mode"],
+            "cohesion_mean": result["cohesion_mean"],
+            "llm_calls":     result["llm_calls"],
+            "n_sentences":   result["n_sentences"],
+        }
+        if gt_cuts:
+            f1, p, r = compute_f1(result["cuts"], gt_cuts, tolerance=1)
+            payload.update({"f1": f1, "precision": p, "recall": r, "gt_cuts": gt_cuts})
+        args.output.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"\nResultado guardado en: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="dataset_generator.py">
+"""
+dataset_generator.py
+--------------------
+Descarga artículos de Wikipedia en español, extrae sus secciones
+y construye instancias de prueba con ground truth para el proyecto
+de segmentación óptima de contenido.
+
+Requisitos:
+    pip install wikipedia-api
+
+Uso:
+    python dataset_generator.py
+    → genera dataset.json en el directorio actual
+"""
+
+import json
+import re
+import time
+import wikipediaapi
+
+# ---------------------------------------------------------------------------
+# Artículos seleccionados por nivel de dificultad
+# Dificultad = qué tan distintas son las secciones entre sí temáticamente
+# ---------------------------------------------------------------------------
+
+ARTICLES = {
+    "facil": [
+        "Fotosíntesis",
+        "Segunda Guerra Mundial",
+        "Sistema solar",
+        "Revolución industrial",
+        "Dinosaurio",
+        "Internet",
+        "Vacuna",
+        "Volcán",
+    ],
+    "medio": [
+        "Inteligencia artificial",
+        "Cambio climático",
+        "Evolución",
+        "Democracia",
+        "Energía solar",
+        "Neurona",
+        "Antibiótico",
+        "Globalización",
+        "Genoma",
+        "Economía",
+        "Filosofía",
+        "Psicología",
+    ],
+    "dificil": [
+        "Relatividad general",
+        "Mecánica cuántica",
+        "Termodinámica",
+        "Lingüística",
+        "Epistemología",
+        "Fenomenología",
+        "Dialéctica",
+        "Hermenéutica",
+    ],
+}
+
+# Secciones de Wikipedia que no aportan contenido útil
+SKIP_SECTIONS = {
+    "véase también", "referencias", "bibliografía", "enlaces externos",
+    "notas", "fuentes", "lecturas adicionales", "galería",
+    "galería de imágenes", "notas al pie", "notas y referencias",
+}
+
+# Parámetros de filtrado
+MIN_SENTENCES_PER_SECTION = 3
+MAX_SENTENCES_PER_SECTION = 30
+MIN_SECTIONS = 3
+MAX_SECTIONS = 7
+
+
+def split_sentences(text: str) -> list[str]:
+    """
+    Divide texto en oraciones usando regex.
+    Sin dependencias externas, funciona bien para español.
+    """
+    # Cortar en . ! ? seguidos de espacio y letra mayúscula
+    # Excluir abreviaturas comunes precedidas por punto
+    pattern = r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑÜ])'
+    parts = re.split(pattern, text.strip())
+    # Filtrar fragmentos muy cortos (artefactos, títulos residuales)
+    return [s.strip() for s in parts if len(s.split()) >= 5]
+
+
+def clean_text(text: str) -> str:
+    """Limpia artefactos típicos del texto de Wikipedia."""
+    text = re.sub(r'\[[\d]+\]', '', text)   # referencias [1], [2]
+    text = re.sub(r'\s+', ' ', text)         # espacios múltiples
+    return text.strip()
+
+
+def fetch_article(wiki, title: str) -> dict | None:
+    """
+    Descarga un artículo y extrae secciones válidas.
+    Devuelve un dict con la estructura del artículo o None si falla.
+    """
+    page = wiki.page(title)
+    if not page.exists():
+        print(f"  [!] No encontrado: {title}")
+        return None
+
+    sections_data = []
+
+    def process_section(section):
+        if len(sections_data) >= MAX_SECTIONS:
+            return
+        if section.title.lower() in SKIP_SECTIONS:
+            return
+
+        text = clean_text(section.text)
+        if text:
+            sentences = split_sentences(text)
+            if len(sentences) >= MIN_SENTENCES_PER_SECTION:
+                sentences = sentences[:MAX_SENTENCES_PER_SECTION]
+                sections_data.append({
+                    "title": section.title,
+                    "sentences": sentences,
+                })
+
+        for child in section.sections:
+            if len(sections_data) >= MAX_SECTIONS:
+                break
+            process_section(child)
+
+    for section in page.sections:
+        if len(sections_data) >= MAX_SECTIONS:
+            break
+        process_section(section)
+
+    if len(sections_data) < MIN_SECTIONS:
+        print(f"  [!] Pocas secciones válidas en '{title}': {len(sections_data)}, descartado")
+        return None
+
+    return {
+        "title": title,
+        "sections": sections_data[:MAX_SECTIONS],
+    }
+
+
+def build_instance(article_data: dict, difficulty: str) -> dict:
+    """
+    Construye la instancia de prueba a partir de los datos del artículo.
+
+    Estructura de salida:
+    {
+        "id": str,
+        "title": str,
+        "difficulty": str,
+        "K": int,                    # número de segmentos (= número de secciones)
+        "sentences": [...],          # todas las oraciones concatenadas
+        "ground_truth_cuts": [...],  # índice donde empieza cada nueva sección (sin el 0)
+        "section_titles": [...],     # títulos de sección (referencia / ground truth)
+        "n_sentences": int
+    }
+    """
+    all_sentences = []
+    cut_positions = []
+    section_titles = []
+
+    for section in article_data["sections"]:
+        cut_positions.append(len(all_sentences))
+        all_sentences.extend(section["sentences"])
+        section_titles.append(section["title"])
+
+    return {
+        "id": re.sub(r'\s+', '_', article_data["title"].lower()),
+        "title": article_data["title"],
+        "difficulty": difficulty,
+        "K": len(article_data["sections"]),
+        "sentences": all_sentences,
+        "ground_truth_cuts": cut_positions[1:],  # excluir posición 0 (trivial)
+        "section_titles": section_titles,
+        "n_sentences": len(all_sentences),
+    }
+
+
+def generate_dataset() -> list[dict]:
+    """Función principal: descarga todos los artículos y construye el dataset."""
+    wiki = wikipediaapi.Wikipedia(
+        language="es",
+        user_agent="ProyectoIA-Segmentacion/1.0 (proyecto universitario)",
+    )
+
+    dataset = []
+    total = sum(len(v) for v in ARTICLES.values())
+    processed = 0
+
+    for difficulty, titles in ARTICLES.items():
+        print(f"\n{'='*50}")
+        print(f"Dificultad: {difficulty.upper()}")
+        print(f"{'='*50}")
+
+        for title in titles:
+            processed += 1
+            print(f"\n[{processed}/{total}] {title}")
+
+            article_data = fetch_article(wiki, title)
+            if article_data is None:
+                continue
+
+            instance = build_instance(article_data, difficulty)
+
+            if instance["n_sentences"] < 10:
+                print(f"  [!] Muy corto ({instance['n_sentences']} oraciones), descartado")
+                continue
+
+            print(f"  ✓ K={instance['K']} secciones | {instance['n_sentences']} oraciones")
+            print(f"    Cortes ground truth: {instance['ground_truth_cuts']}")
+            dataset.append(instance)
+
+            time.sleep(0.5)
+
+    return dataset
+
+
+def print_summary(dataset: list[dict]) -> None:
+    print(f"\n{'='*50}")
+    print("RESUMEN DEL DATASET")
+    print(f"{'='*50}")
+    print(f"Total instancias: {len(dataset)}")
+
+    for diff in ["facil", "medio", "dificil"]:
+        subset = [d for d in dataset if d["difficulty"] == diff]
+        if not subset:
+            continue
+        avg_s = sum(d["n_sentences"] for d in subset) / len(subset)
+        avg_k = sum(d["K"] for d in subset) / len(subset)
+        print(f"\n  {diff.upper()} — {len(subset)} instancias")
+        print(f"    Oraciones promedio : {avg_s:.1f}")
+        print(f"    K promedio         : {avg_k:.1f}")
+
+
+if __name__ == "__main__":
+    print("Generando dataset de Wikipedia en español...")
+    print("Requisito: pip install wikipedia-api\n")
+
+    dataset = generate_dataset()
+    print_summary(dataset)
+
+    output_path = "dataset.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(dataset, f, ensure_ascii=False, indent=2)
+
+    print(f"\n✓ Dataset guardado en: {output_path}")
+    print(f"  {len(dataset)} instancias listas")
+</file>
+
+<file path="dataset_synthetic.py">
+"""
+dataset_synthetic.py
+--------------------
+Genera un dataset sintético con cambios de tema muy marcados
+para verificar que los modelos de embeddings funcionan correctamente.
+
+Estrategia: combinar fragmentos de artículos sobre temas completamente
+distintos en un solo texto. Los cortes reales son exactamente donde
+cambia el tema — debería ser fácil de detectar para los embeddings.
+
+Uso:
+    python dataset_synthetic.py
+    → genera dataset_synthetic.json
+"""
+
+import json
+import re
+import time
+import random
+from pathlib import Path
+import wikipediaapi
+
+# ---------------------------------------------------------------------------
+# Grupos de temas muy distintos entre sí
+# Cada instancia sintética combina K artículos de grupos diferentes
+# ---------------------------------------------------------------------------
+
+TOPIC_GROUPS = {
+    "ciencias_naturales": [
+        "Fotosíntesis", "Mitocondria", "Célula", "ADN", "Evolución"
+    ],
+    "historia": [
+        "Imperio romano", "Revolución francesa", "Segunda Guerra Mundial",
+        "Edad Media", "Conquista de América"
+    ],
+    "astronomia": [
+        "Agujero negro", "Sistema solar", "Via Láctea", "Estrella de neutrones", "Cometa"
+    ],
+    "tecnologia": [
+        "Internet", "Inteligencia artificial", "Computadora", "Robot", "Satélite artificial"
+    ],
+    "arte_cultura": [
+        "Pintura", "Música clásica", "Literatura", "Escultura", "Arquitectura"
+    ],
+    "geografia": [
+        "Amazonas", "Cordillera de los Andes", "Desierto del Sahara", "Océano Pacífico", "Himalaya"
+    ],
+}
+
+# Configuración de instancias sintéticas
+INSTANCES_CONFIG = [
+    # (K, grupos a combinar) — K = número de segmentos
+    (3, ["ciencias_naturales", "historia", "astronomia"]),
+    (3, ["tecnologia", "arte_cultura", "geografia"]),
+    (3, ["historia", "tecnologia", "ciencias_naturales"]),
+    (4, ["ciencias_naturales", "historia", "astronomia", "tecnologia"]),
+    (4, ["arte_cultura", "geografia", "historia", "ciencias_naturales"]),
+    (4, ["tecnologia", "astronomia", "arte_cultura", "geografia"]),
+    (5, ["ciencias_naturales", "historia", "astronomia", "tecnologia", "arte_cultura"]),
+    (5, ["historia", "geografia", "tecnologia", "ciencias_naturales", "astronomia"]),
+    (5, ["arte_cultura", "historia", "geografia", "astronomia", "tecnologia"]),
+    (6, ["ciencias_naturales", "historia", "astronomia", "tecnologia", "arte_cultura", "geografia"]),
+    (6, ["historia", "tecnologia", "ciencias_naturales", "astronomia", "geografia", "arte_cultura"]),
+    (3, ["astronomia", "arte_cultura", "geografia"]),
+    (4, ["historia", "ciencias_naturales", "geografia", "tecnologia"]),
+    (5, ["astronomia", "arte_cultura", "historia", "tecnologia", "geografia"]),
+]
+
+SENTENCES_PER_SEGMENT = 8   # oraciones por segmento
+SKIP_SECTIONS = {
+    "véase también", "referencias", "bibliografía", "enlaces externos",
+    "notas", "fuentes", "lecturas adicionales", "galería",
+    "galería de imágenes", "notas al pie", "notas y referencias",
+}
+
+
+def split_sentences(text: str) -> list[str]:
+    """Divide texto en oraciones usando regex."""
+    pattern = r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑÜ])'
+    parts = re.split(pattern, text.strip())
+    return [s.strip() for s in parts if len(s.split()) >= 5]
+
+
+def clean_text(text: str) -> str:
+    text = re.sub(r'\[[\d]+\]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def fetch_sentences_from_article(wiki, title: str, n_sentences: int) -> list[str] | None:
+    """
+    Descarga un artículo y extrae exactamente n_sentences oraciones
+    del cuerpo principal (evitando secciones de referencias etc.)
+    """
+    page = wiki.page(title)
+    if not page.exists():
+        return None
+
+    all_sentences = []
+
+    # Primero intentar el resumen/introducción
+    if page.summary:
+        text = clean_text(page.summary)
+        all_sentences.extend(split_sentences(text))
+
+    # Luego las secciones principales
+    for section in page.sections:
+        if len(all_sentences) >= n_sentences * 2:
+            break
+        if section.title.lower() in SKIP_SECTIONS:
+            continue
+        text = clean_text(section.text)
+        if text:
+            all_sentences.extend(split_sentences(text))
+
+    if len(all_sentences) < n_sentences:
+        return None
+
+    # Tomar exactamente n_sentences del inicio
+    return all_sentences[:n_sentences]
+
+
+def build_synthetic_instance(
+    wiki,
+    instance_id: int,
+    K: int,
+    group_names: list[str],
+    topic_groups: dict,
+    used_articles: set,
+) -> dict | None:
+    """
+    Construye una instancia sintética combinando K fragmentos
+    de artículos sobre temas completamente distintos.
+    """
+    segments = []
+    section_titles = []
+
+    for group_name in group_names:
+        candidates = topic_groups[group_name]
+        # Elegir un artículo no usado de este grupo
+        available = [a for a in candidates if a not in used_articles]
+        if not available:
+            available = candidates  # reusar si no hay disponibles
+
+        article_title = random.choice(available)
+        used_articles.add(article_title)
+
+        print(f"    Descargando: {article_title} ({group_name})")
+        sentences = fetch_sentences_from_article(wiki, article_title, SENTENCES_PER_SEGMENT)
+
+        if sentences is None:
+            print(f"    [!] No se pudo obtener oraciones de: {article_title}")
+            return None
+
+        segments.append({
+            "article": article_title,
+            "group": group_name,
+            "sentences": sentences,
+        })
+        section_titles.append(f"{article_title} ({group_name})")
+        time.sleep(0.3)
+
+    # Construir instancia
+    all_sentences = []
+    cut_positions = []
+
+    for seg in segments:
+        cut_positions.append(len(all_sentences))
+        all_sentences.extend(seg["sentences"])
+
+    return {
+        "id": f"synthetic_{instance_id:03d}",
+        "title": " | ".join(seg["article"] for seg in segments),
+        "difficulty": "synthetic_marcado",
+        "K": K,
+        "sentences": all_sentences,
+        "ground_truth_cuts": cut_positions[1:],
+        "section_titles": section_titles,
+        "n_sentences": len(all_sentences),
+        "segments_info": [
+            {"article": seg["article"], "group": seg["group"]}
+            for seg in segments
+        ],
+    }
+
+
+def generate_synthetic_dataset() -> list[dict]:
+    wiki = wikipediaapi.Wikipedia(
+        language="es",
+        user_agent="ProyectoIA-Segmentacion/1.0 (proyecto universitario)",
+    )
+
+    dataset = []
+    used_articles: set = set()
+
+    for i, (K, group_names) in enumerate(INSTANCES_CONFIG):
+        print(f"\n[{i+1}/{len(INSTANCES_CONFIG)}] K={K} — {' + '.join(group_names)}")
+
+        instance = build_synthetic_instance(
+            wiki, i + 1, K, group_names, TOPIC_GROUPS, used_articles
+        )
+
+        if instance is None:
+            print(f"  [!] Instancia {i+1} descartada")
+            continue
+
+        print(f"  ✓ {instance['n_sentences']} oraciones | cortes en: {instance['ground_truth_cuts']}")
+        dataset.append(instance)
+
+    return dataset
+
+
+if __name__ == "__main__":
+    random.seed(42)
+
+    print("Generando dataset sintético con cambios marcados de tema...")
+    print(f"Instancias a generar: {len(INSTANCES_CONFIG)}\n")
+
+    dataset = generate_synthetic_dataset()
+
+    output_path = "dataset_synthetic.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(dataset, f, ensure_ascii=False, indent=2)
+
+    print(f"\n{'='*55}")
+    print(f"✓ Dataset sintético guardado en: {output_path}")
+    print(f"  {len(dataset)} instancias generadas")
+    print(f"\nEstructura:")
+    print(f"  Oraciones por segmento : {SENTENCES_PER_SEGMENT}")
+    print(f"  K range                : {min(K for K,_ in INSTANCES_CONFIG)}-{max(K for K,_ in INSTANCES_CONFIG)}")
+    print(f"\nEjemplo de instancia:")
+    if dataset:
+        ex = dataset[0]
+        print(f"  Título  : {ex['title']}")
+        print(f"  K       : {ex['K']}")
+        print(f"  Cortes  : {ex['ground_truth_cuts']}")
+        print(f"  Temas   : {[s['group'] for s in ex['segments_info']]}")
+</file>
+
+<file path="embeddings.py">
+"""
+embeddings.py
+-------------
+Fase 1 del sistema de segmentación óptima de contenido.
+
+Dado un texto dividido en oraciones, calcula embeddings semánticos,
+mide la similitud coseno entre oraciones adyacentes y produce una
+lista ordenada de posiciones candidatas a corte (de más a menos
+prometedora). Esta lista guía la inicialización del Simulated
+Annealing en la Fase 2.
+
+A diferencia de un filtro estricto, aquí se devuelven TODAS las
+posiciones posibles ordenadas por prioridad — garantizando recall
+del 100% mientras se aprovecha la información semántica.
+
+Modelos (cargados desde carpetas locales):
+    A) models/paraphrase-multilingual-MiniLM-L12-v2  (rápido)
+    B) models/paraphrase-multilingual-mpnet-base-v2  (más preciso)
+
+Requisitos:
+    pip install sentence-transformers
+
+Uso como módulo:
+    from embeddings import get_ranked_candidates, get_initial_cuts
+
+Uso standalone:
+    python embeddings.py
+"""
+
+import json
+import numpy as np
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+
+# ---------------------------------------------------------------------------
+# Rutas locales a los modelos
+# ---------------------------------------------------------------------------
+
+MODELS_DIR = Path("./models")
+MODEL_A = str(MODELS_DIR / "paraphrase-multilingual-MiniLM-L12-v2")
+MODEL_B = str(MODELS_DIR / "paraphrase-multilingual-mpnet-base-v2")
+
+_model_cache: dict[str, SentenceTransformer] = {}
+
+
+def load_model(model_path: str) -> SentenceTransformer:
+    if model_path not in _model_cache:
+        path = Path(model_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Modelo no encontrado en: {model_path}")
+        print(f"  Cargando modelo: {Path(model_path).name} ...")
+        _model_cache[model_path] = SentenceTransformer(model_path)
+        print(f"  Modelo cargado.")
+    return _model_cache[model_path]
+
+
+def compute_embeddings(sentences: list[str], model_path: str) -> np.ndarray:
+    model = load_model(model_path)
+    return model.encode(sentences, show_progress_bar=False, convert_to_numpy=True)
+
+
+def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (n1 * n2))
+
+
+def compute_similarity_profile(embeddings: np.ndarray) -> list[float]:
+    similarities = []
+    for i in range(len(embeddings) - 1):
+        sim = cosine_similarity(embeddings[i], embeddings[i + 1])
+        similarities.append(sim)
+    return similarities
+
+
+def get_ranked_candidates(
+    sentences: list[str],
+    model_path: str,
+) -> list[tuple[int, float]]:
+    """
+    Devuelve TODAS las posiciones posibles de corte ordenadas
+    de más a menos prometedora (menor similitud = mejor candidato).
+
+    Retorna lista de tuplas (posición, similitud) ordenada ascendentemente.
+    Posición i significa corte entre oración i-1 e i.
+    """
+    n = len(sentences)
+    if n < 2:
+        return []
+
+    embeddings   = compute_embeddings(sentences, model_path)
+    similarities = compute_similarity_profile(embeddings)
+    ranked       = [(i + 1, sim) for i, sim in enumerate(similarities)]
+    ranked.sort(key=lambda x: x[1])
+    return ranked
+
+
+def get_initial_cuts(
+    ranked_candidates: list[tuple[int, float]],
+    K: int,
+) -> list[int]:
+    """
+    Selecciona los K-1 mejores candidatos como estado inicial para el SA.
+    Retorna lista ordenada de K-1 posiciones de corte.
+    """
+    best = ranked_candidates[:K - 1]
+    return sorted([pos for pos, _ in best])
+
+
+# ---------------------------------------------------------------------------
+# Evaluación agregada
+# ---------------------------------------------------------------------------
+
+def evaluate_recall(
+    dataset: list[dict],
+    model_path: str,
+) -> dict:
+    """
+    Calcula recall top-K y top-2K promedio sobre todo el dataset.
+    """
+    recalls_k, recalls_2k = [], []
+
+    for instance in dataset:
+        sentences = instance["sentences"]
+        K         = instance["K"]
+        gt_set    = set(instance["ground_truth_cuts"])
+
+        ranked  = get_ranked_candidates(sentences, model_path)
+        top_k   = set(pos for pos, _ in ranked[:K - 1])
+        top_2k  = set(pos for pos, _ in ranked[:(K - 1) * 2])
+
+        recalls_k.append(len(gt_set & top_k)  / len(gt_set) if gt_set else 0.0)
+        recalls_2k.append(len(gt_set & top_2k) / len(gt_set) if gt_set else 0.0)
+
+    return {
+        "recall_k":  sum(recalls_k)  / len(recalls_k),
+        "recall_2k": sum(recalls_2k) / len(recalls_2k),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prueba standalone
+# ---------------------------------------------------------------------------
+
+def test_instance(instance: dict, model_path: str, model_label: str) -> None:
+    sentences = instance["sentences"]
+    K         = instance["K"]
+    gt_cuts   = instance["ground_truth_cuts"]
+    n         = instance["n_sentences"]
+
+    ranked       = get_ranked_candidates(sentences, model_path)
+    initial_cuts = get_initial_cuts(ranked, K)
+    gt_set       = set(gt_cuts)
+    top_k        = set(pos for pos, _ in ranked[:K - 1])
+    top_2k       = set(pos for pos, _ in ranked[:(K - 1) * 2])
+    recall_k     = len(gt_set & top_k)  / len(gt_set) if gt_set else 0.0
+    recall_2k    = len(gt_set & top_2k) / len(gt_set) if gt_set else 0.0
+
+    print(f"\n{'─'*60}")
+    print(f"Instancia       : {instance['title']}")
+    print(f"Oraciones       : {n}  |  K={K}  |  GT: {gt_cuts}")
+    print(f"Modelo          : {model_label}")
+    print(f"Cortes iniciales: {initial_cuts}")
+    print(f"Top-{K-1} posiciones: {[pos for pos, _ in ranked[:K-1]]}")
+    print(f"Recall top-K    : {recall_k:.0%}  ({len(gt_set & top_k)}/{len(gt_set)})")
+    print(f"Recall top-2K   : {recall_2k:.0%}  ({len(gt_set & top_2k)}/{len(gt_set)})")
+
+
+if __name__ == "__main__":
+    # Verificar modelos
+    print("Verificando modelos...")
+    for label, path in [("Modelo A (MiniLM)", MODEL_A), ("Modelo B (mpnet)", MODEL_B)]:
+        status = "✓" if Path(path).exists() else "✗ NO ENCONTRADO"
+        print(f"  {status}  {label}: {path}")
+
+    # Cargar ambos datasets
+    datasets = {}
+    for name, fname in [("Wikipedia", "dataset.json"), ("Sintético", "dataset_synthetic.json")]:
+        p = Path(fname)
+        if p.exists():
+            with open(p, encoding="utf-8") as f:
+                datasets[name] = json.load(f)
+            print(f"  ✓  Dataset {name}: {len(datasets[name])} instancias")
+        else:
+            print(f"  ✗  Dataset {name}: no encontrado")
+
+    if not datasets:
+        print("ERROR: No se encontró ningún dataset.")
+        exit(1)
+
+    # -----------------------------------------------------------------------
+    # Tabla de recall agregado
+    # -----------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("RECALL AGREGADO POR DATASET Y MODELO")
+    print(f"{'='*60}")
+    print(f"{'Dataset':<12} {'Modelo':<22} {'top-K':>7} {'top-2K':>8}")
+    print(f"{'─'*12} {'─'*22} {'─'*7} {'─'*8}")
+
+    for ds_name, dataset in datasets.items():
+        for label, path in [("MiniLM (A)", MODEL_A), ("mpnet (B)", MODEL_B)]:
+            if not Path(path).exists():
+                continue
+            stats = evaluate_recall(dataset, path)
+            print(f"{ds_name:<12} {label:<22} {stats['recall_k']:>6.0%} {stats['recall_2k']:>7.0%}")
+
+    # -----------------------------------------------------------------------
+    # Detalle de las 3 primeras instancias de cada dataset
+    # -----------------------------------------------------------------------
+    for ds_name, dataset in datasets.items():
+        print(f"\n{'='*60}")
+        print(f"DETALLE — 3 PRIMERAS INSTANCIAS ({ds_name})")
+        print(f"{'='*60}")
+        for instance in dataset[:3]:
+            for label, path in [("MiniLM (A)", MODEL_A), ("mpnet (B)", MODEL_B)]:
+                if Path(path).exists():
+                    test_instance(instance, path, label)
+</file>
+
+<file path="llm_evaluator.py">
+"""
+llm_evaluator.py
+----------------
+Fase 3 del sistema de segmentación óptima de contenido.
+
+Evalúa la cohesión semántica de segmentos de texto usando
+el LLM de Cerebras. Incluye:
+  - Cache de evaluaciones para minimizar llamadas a la API
+  - Evaluación de segmentos individuales (usada por el SA)
+  - Sugerencia de movimiento guiado por LLM (mejora del SA)
+  - Validación de fronteras para segmentación adaptativa (judge_boundary)
+
+Requisitos:
+    pip install cerebras-cloud-sdk python-dotenv
+
+Uso como módulo:
+    from llm_evaluator import evaluate_segment, suggest_move, judge_boundary
+
+Uso standalone (prueba):
+    python llm_evaluator.py
+"""
+
+import os
+import re
+import json
+import time
+from pathlib import Path
+from dotenv import load_dotenv
+from cerebras.cloud.sdk import Cerebras
+
+# ---------------------------------------------------------------------------
+# Configuración
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+if not CEREBRAS_API_KEY:
+    raise EnvironmentError(
+        "No se encontró CEREBRAS_API_KEY en el archivo .env\n"
+        "Asegúrate de tener un archivo .env con:\n"
+        "CEREBRAS_API_KEY=tu_api_key"
+    )
+
+MODEL       = "gpt-oss-120b"
+MAX_RETRIES = 3
+RETRY_DELAY = 5.0  # segundos entre reintentos
+
+# Cache global: (inicio, fin, texto_hash) → puntuación
+_eval_cache: dict[tuple, float] = {}
+_cache_hits   = 0
+_cache_misses = 0
+
+# Cliente Cerebras (inicializado una vez)
+_client = Cerebras(api_key=CEREBRAS_API_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+EVAL_PROMPT = """Analiza el siguiente fragmento de texto y evalúa qué tan cohesionado es temáticamente, es decir, qué tan bien todas sus oraciones tratan un mismo tema central.
+
+Primero explica brevemente tu razonamiento (2-3 oraciones).
+Luego, en la última línea, escribe SOLO un número entero del 1 al 10.
+
+Texto:
+{texto}"""
+
+SUGGEST_PROMPT = """Tienes un texto dividido en segmentos. Analiza los dos segmentos adyacentes que se muestran y decide si el corte entre ellos está bien colocado o debería moverse.
+
+Segmento izquierdo (termina en el corte actual):
+{seg_izq}
+
+Segmento derecho (empieza en el corte actual):
+{seg_der}
+
+Responde SOLO con una de estas tres opciones:
+- IZQUIERDA (el corte debería moverse una posición hacia la izquierda)
+- DERECHA (el corte debería moverse una posición hacia la derecha)
+- MANTENER (el corte está bien donde está)
+
+Respuesta:"""
+
+BOUNDARY_PROMPT = """Analiza los dos fragmentos de texto que se muestran a continuación y decide si entre ellos hay un cambio de tema real.
+
+Fragmento IZQUIERDO (final del segmento anterior):
+{seg_izq}
+
+Fragmento DERECHO (inicio del siguiente segmento):
+{seg_der}
+
+Responde SOLO con una de estas dos opciones:
+- SI (hay un cambio de tema claro entre los dos fragmentos)
+- NO (los dos fragmentos tratan el mismo tema o son muy similares)
+
+Respuesta:"""
+
+
+# ---------------------------------------------------------------------------
+# Llamada al LLM con manejo de errores
+# ---------------------------------------------------------------------------
+
+def _call_llm(prompt: str) -> str:
+    """
+    Llama a la API de Cerebras con reintentos automáticos.
+    Maneja respuestas None y errores de red.
+    Retorna el texto de la respuesta o lanza RuntimeError si falla.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = _client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.1,
+            )
+            content = response.choices[0].message.content
+            if content is None:
+                raise ValueError("Respuesta vacía del LLM (content=None)")
+            return content.strip()
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                print(f"  [LLM] Error en intento {attempt+1}: {e}. Reintentando...")
+                time.sleep(RETRY_DELAY)
+            else:
+                raise RuntimeError(f"LLM falló tras {MAX_RETRIES} intentos: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Funciones de parsing
+# ---------------------------------------------------------------------------
+
+def _parse_score(response: str) -> float:
+    """
+    Extrae la puntuación numérica del 1 al 10 de la respuesta del LLM.
+    Toma el último número entero que aparece en la respuesta.
+    """
+    numbers = re.findall(r'\b([1-9]|10)\b', response)
+    if not numbers:
+        return 5.0
+    return float(numbers[-1])
+
+
+def _make_cache_key(sentences: list[str], start: int, end: int) -> tuple:
+    """Genera una clave única para el cache basada en el contenido del segmento."""
+    text = " ".join(sentences[start:end])
+    return (start, end, hash(text))
+
+
+# ---------------------------------------------------------------------------
+# Funciones principales
+# ---------------------------------------------------------------------------
+
+def evaluate_segment(
+    sentences: list[str],
+    start: int,
+    end: int,
+    verbose: bool = False,
+) -> float:
+    """
+    Evalúa la cohesión semántica de un segmento.
+
+    Parámetros:
+        sentences : lista completa de oraciones del texto
+        start     : índice de inicio del segmento (inclusivo)
+        end       : índice de fin del segmento (exclusivo)
+        verbose   : si True, muestra la respuesta completa del LLM
+
+    Retorna:
+        Puntuación de cohesión entre 1.0 y 10.0
+        Devuelve 5.0 si la API falla (valor neutro, no detiene el SA)
+    """
+    global _cache_hits, _cache_misses
+
+    if start >= end:
+        return 0.0
+
+    # Verificar cache
+    key = _make_cache_key(sentences, start, end)
+    if key in _eval_cache:
+        _cache_hits += 1
+        return _eval_cache[key]
+
+    _cache_misses += 1
+
+    texto  = " ".join(sentences[start:end])
+    prompt = EVAL_PROMPT.format(texto=texto)
+
+    try:
+        response = _call_llm(prompt)
+    except RuntimeError:
+        # Si la API falla, devolver valor neutro sin detener el SA
+        return 5.0
+
+    if verbose:
+        print(f"\n  [LLM respuesta] oraciones[{start}:{end}]:")
+        print(f"  {response}")
+
+    score = _parse_score(response)
+
+    _eval_cache[key] = score
+    return score
+
+
+def evaluate_partition(
+    sentences: list[str],
+    cuts: list[int],
+    verbose: bool = False,
+) -> tuple[float, list[float]]:
+    """
+    Evalúa una partición completa sumando la cohesión de todos sus segmentos.
+
+    Retorna:
+        (score_total, [score_seg1, score_seg2, ...])
+    """
+    n          = len(sentences)
+    boundaries = [0] + cuts + [n]
+    scores     = []
+
+    for i in range(len(boundaries) - 1):
+        start = boundaries[i]
+        end   = boundaries[i + 1]
+        score = evaluate_segment(sentences, start, end, verbose=verbose)
+        scores.append(score)
+
+        if verbose:
+            print(f"  Segmento {i+1} [{start}:{end}]: {score:.1f}/10")
+
+    return sum(scores), scores
+
+
+def suggest_move(
+    sentences: list[str],
+    cuts: list[int],
+    cut_index: int,
+) -> str:
+    """
+    Pide al LLM que sugiera si un corte específico debería moverse.
+    Usada por el SA para el movimiento guiado.
+
+    Retorna:
+        "IZQUIERDA", "DERECHA", o "MANTENER"
+    """
+    n             = len(sentences)
+    boundaries    = [0] + cuts + [n]
+    cut_pos       = cuts[cut_index]
+    seg_izq_start = boundaries[cut_index]
+    seg_der_end   = boundaries[cut_index + 2]
+
+    MAX_CTX = 6
+    seg_izq = sentences[max(seg_izq_start, cut_pos - MAX_CTX) : cut_pos]
+    seg_der = sentences[cut_pos : min(seg_der_end, cut_pos + MAX_CTX)]
+
+    prompt   = SUGGEST_PROMPT.format(
+        seg_izq=" ".join(seg_izq),
+        seg_der=" ".join(seg_der),
+    )
+
+    try:
+        response = _call_llm(prompt)
+    except RuntimeError:
+        return "MANTENER"
+
+    response_upper = response.upper()
+    if "IZQUIERDA" in response_upper:
+        return "IZQUIERDA"
+    elif "DERECHA" in response_upper:
+        return "DERECHA"
+    return "MANTENER"
+
+
+def judge_boundary(
+    sentences: list[str],
+    cut: int,
+    window: int = 3,
+) -> bool:
+    """
+    Decide si una posición de corte representa una frontera temática real.
+    Usada por la segmentación adaptativa (adaptive_segmentation.py).
+
+    Compara las `window` oraciones antes y después del corte.
+    Devuelve True si el LLM detecta un cambio de tema claro.
+
+    Parámetros:
+        sentences : lista completa de oraciones
+        cut       : posición del corte candidato
+        window    : número de oraciones de contexto a cada lado
+
+    Retorna:
+        True  → hay cambio de tema, mantener el corte
+        False → mismo tema, descartar el corte
+        True  → si la API falla (conservador: no descartar por error)
+    """
+    n = len(sentences)
+
+    seg_izq = sentences[max(0, cut - window) : cut]
+    seg_der = sentences[cut : min(n, cut + window)]
+
+    if not seg_izq or not seg_der:
+        return True  # en los bordes, mantener el corte
+
+    prompt = BOUNDARY_PROMPT.format(
+        seg_izq=" ".join(seg_izq),
+        seg_der=" ".join(seg_der),
+    )
+
+    try:
+        response = _call_llm(prompt)
+    except RuntimeError:
+        return True  # si falla, asumir frontera válida
+
+    return "SI" in response.upper()
+
+
+def get_cache_stats() -> dict:
+    """Retorna estadísticas del cache para análisis experimental."""
+    total = _cache_hits + _cache_misses
+    return {
+        "hits":             _cache_hits,
+        "misses":           _cache_misses,
+        "total_calls":      total,
+        "hit_rate":         _cache_hits / total if total > 0 else 0.0,
+        "llm_calls_saved":  _cache_hits,
+    }
+
+
+def reset_cache() -> None:
+    """Limpia el cache (útil entre instancias del experimento)."""
+    global _eval_cache, _cache_hits, _cache_misses
+    _eval_cache.clear()
+    _cache_hits   = 0
+    _cache_misses = 0
+
+
+# ---------------------------------------------------------------------------
+# Prueba standalone
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("PRUEBA FASE 3 — LLM EVALUADOR (Cerebras)")
+    print("=" * 60)
+
+    for dataset_file in ["dataset.json", "dataset_synthetic.json"]:
+        path = Path(dataset_file)
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                dataset = json.load(f)
+            print(f"Dataset cargado: {dataset_file} ({len(dataset)} instancias)")
+            break
+    else:
+        print("ERROR: No se encontró ningún dataset.")
+        exit(1)
+
+    instance  = dataset[0]
+    sentences = instance["sentences"]
+    K         = instance["K"]
+    gt_cuts   = instance["ground_truth_cuts"]
+    n         = instance["n_sentences"]
+
+    print(f"\nInstancia : {instance['title']}")
+    print(f"Oraciones : {n}  |  K={K}  |  GT cuts: {gt_cuts}")
+
+    # Prueba 1: partición con ground truth
+    print(f"\n{'─'*60}")
+    print("Prueba 1: Partición con cortes reales (ground truth)")
+    print(f"{'─'*60}")
+    total_gt, scores_gt = evaluate_partition(sentences, gt_cuts, verbose=True)
+    print(f"\nScore total (GT)   : {total_gt:.1f}")
+    print(f"Score promedio     : {total_gt/K:.2f}/10")
+
+    # Prueba 2: partición equidistante mala
+    print(f"\n{'─'*60}")
+    print("Prueba 2: Partición equidistante (mala)")
+    print(f"{'─'*60}")
+    step     = n // K
+    bad_cuts = [step * i for i in range(1, K)]
+    print(f"Cortes             : {bad_cuts}")
+    total_bad, scores_bad = evaluate_partition(sentences, bad_cuts, verbose=True)
+    print(f"\nScore total (malo) : {total_bad:.1f}")
+    print(f"Score promedio     : {total_bad/K:.2f}/10")
+
+    # Prueba 3: judge_boundary en el primer corte real
+    print(f"\n{'─'*60}")
+    print("Prueba 3: judge_boundary en cortes reales")
+    print(f"{'─'*60}")
+    for cut in gt_cuts:
+        result = judge_boundary(sentences, cut, window=3)
+        print(f"  Corte {cut}: {'✓ frontera válida' if result else '✗ descartado'}")
+
+    # Estadísticas
+    print(f"\n{'─'*60}")
+    stats = get_cache_stats()
+    print("Estadísticas del cache:")
+    print(f"  Llamadas al LLM : {stats['misses']}")
+    print(f"  Cache hits      : {stats['hits']}")
+    print(f"  Tasa de acierto : {stats['hit_rate']:.0%}")
+</file>
+
+<file path="Orientación.md">
+# Orientación del Proyecto Final Inteligencia Artificial 2025-2026
+
+Desarrollar un sistema que resuelva un problema de optimización, planificación, satisfacción de restricciones, ... mediante técnicas y herramientas dadas en la asignatura, incorporando un modelo de lenguaje (LLM) como parte funcional del sistema.
+
+Cada equipo (equipos de 1 persona) deberá seleccionar uno de los 10 temas propuestos:
+
+| Tema | Descripción |
+|------|-------------|
+| 1 | **Priorización de casos clínicos bajo recursos limitados**<br>Diseñar un sistema que, dado un conjunto de pacientes con información estructurada y descripciones textuales, determine un orden de atención que maximice el impacto total bajo restricciones de recursos. El sistema debe utilizar un LLM para interpretar o enriquecer la información textual de los casos y apoyar la evaluación de las decisiones. |
+| 2 | **Construcción de resúmenes como selección óptima de segmentos**<br>Dado un conjunto de fragmentos extraídos de un video educativo, seleccionar y ordenar un subconjunto que represente adecuadamente el contenido bajo un límite de longitud. El sistema debe utilizar un LLM para evaluar la coherencia y relevancia de los resúmenes generados. |
+| 3 | **Planificación de trayectoria profesional**<br>Dado un conjunto de habilidades, cursos y restricciones de prerequisitos, construir una secuencia válida que permita alcanzar un objetivo profesional. El sistema debe utilizar un LLM para interpretar objetivos en lenguaje natural y evaluar la calidad de las trayectorias propuestas. |
+| 4 | **Detección de patrones sospechosos en secuencias de mensajes**<br>Dada una secuencia de mensajes de una conversación, identificar subsecuencias que correspondan a comportamientos sospechosos definidos por reglas generales. El sistema debe utilizar un LLM para analizar el contenido textual y apoyar la interpretación de patrones complejos. |
+| 5 | **Reparación de inconsistencias en historiales**<br>Dado un conjunto de hechos (estructurados y textuales) que pueden contener contradicciones, encontrar un conjunto mínimo de modificaciones que restaure la coherencia global. El sistema debe utilizar un LLM para evaluar la consistencia semántica entre los elementos del historial. |
+| 6 | **Segmentación óptima de contenido**<br>Dada una secuencia de elementos (texto o fragmentos de contenido), dividirla en segmentos contiguos que maximicen la coherencia interna. El sistema debe utilizar un LLM para evaluar la cohesión semántica de cada segmento. |
+| 7 | **Exploración de trayectorias profesionales alternativas**<br>Dado un conjunto de decisiones posibles en una carrera profesional, generar y evaluar múltiples trayectorias válidas bajo distintos criterios. El sistema debe utilizar un LLM para analizar y comparar cualitativamente las trayectorias generadas. |
+| 8 | **Generación de mensajes bajo restricciones estructurales**<br>Construir mensajes que cumplan un conjunto de reglas estructurales y restricciones definidas (longitud, contenido, forma). El sistema debe utilizar un LLM como componente en la generación y evaluación de los mensajes. |
+| 9 | **Construcción de rutas de aprendizaje**<br>Dado un conjunto de recursos con dependencias, construir una secuencia válida que optimice el aprendizaje bajo restricciones de tiempo. El sistema debe utilizar un LLM para interpretar descripciones de recursos y evaluar su utilidad relativa. |
+| 10 | **Identificación de anomalías en secuencias**<br>Dada una secuencia de eventos, encontrar el subconjunto mínimo cuya eliminación permite que la secuencia cumpla un conjunto de reglas. El sistema debe utilizar un LLM para interpretar el significado de los eventos y apoyar la evaluación de las reglas. |
+
+## Diseño experimental
+
+El proyecto debe incluir:
+
+- Conjunto de instancias de prueba (generadas o reales) (generadas u obtenidas por el estudiante)
+- Comparación entre distintas configuraciones o variantes
+- Análisis del comportamiento del sistema
+
+## Profe, ¿qué debo entregar?
+
+### 1. Código fuente
+
+Debe incluir:
+- Dataset
+- Implementación completa del sistema
+- Instrucciones de ejecución
+- Configuración del uso del LLM
+
+### 2. Informe técnico
+
+Debe incluir:
+- Descripción del problema
+- Modelado formal
+- Descripción del dataset utilizado, ya sea obtenido o generado y, en caso de ser generado, describir el proceso de generación y explicar por qué cumple las condiciones para el problema definido
+- Diseño del algoritmo
+- Rol del LLM en el sistema
+- Metodología experimental
+- Resultados y análisis
+- Limitaciones y posibles mejoras
+</file>
+
+<file path="requirements.txt">
+wikipedia-api
+nltk
+numpy
+sentence_transformers
+</file>
+
+<file path="simulated_annealing.py">
+"""
+simulated_annealing.py
+----------------------
+Fase 2 del sistema de segmentación óptima de contenido.
+
+Dado un texto dividido en oraciones, un número de segmentos K,
+y un estado inicial de cortes (de la Fase 1), busca la partición
+que maximiza la cohesión semántica total evaluada por el LLM (Fase 3).
+
+Algoritmo: Simulated Annealing con dos tipos de movimiento:
+  - Movimiento aleatorio (80%): desplaza un corte ±1 posición
+  - Movimiento guiado (20%):    el LLM sugiere la dirección del desplazamiento
+
+Optimizaciones:
+  - Cache de evaluaciones LLM (heredado de llm_evaluator.py)
+  - Solo evalúa los segmentos que cambian en cada iteración (1-2 llamadas/iter)
+  - Iteraciones calculadas automáticamente según el tamaño del problema
+
+Fórmula de iteraciones:
+  max_iter = (N - 1) * (K - 1) * ITER_FACTOR
+  donde N = número de oraciones, K = número de segmentos
+  Ejemplo: N=88, K=7 → 87 * 6 * 5 = 2610 iteraciones
+
+Requisitos:
+    pip install sentence-transformers cerebras-cloud-sdk python-dotenv
+
+Uso como módulo:
+    from simulated_annealing import run_sa
+    result = run_sa(sentences, K, initial_cuts, model_path)
+
+Uso standalone:
+    python simulated_annealing.py
+"""
+
+import json
+import math
+import random
+import sys
+import time
+from pathlib import Path
+
+from embeddings import get_ranked_candidates, get_initial_cuts, MODEL_A, MODEL_B
+from llm_evaluator import evaluate_segment, suggest_move, get_cache_stats, reset_cache
+
+# ---------------------------------------------------------------------------
+# Parámetros del SA
+# ---------------------------------------------------------------------------
+
+TEMP_INITIAL   = 1.0
+COOLING_RATE   = 0.995
+ITER_FACTOR    = 5      # multiplicador para calcular iteraciones automáticamente
+LLM_GUIDE_PROB = 0.0
+MIN_SEGMENT_SIZE = 3   # por debajo de esto se penaliza el score
+PENALTY_PER_MISSING = 0.5  # penalización por cada oración que falta para llegar al mínimo   # probabilidad de movimiento guiado por LLM
+
+
+# ---------------------------------------------------------------------------
+# Cálculo automático de iteraciones
+# ---------------------------------------------------------------------------
+
+def compute_max_iter(n_sentences: int, K: int) -> int:
+    """
+    Calcula el número de iteraciones en base al tamaño del problema.
+
+    Fórmula: (N-1) * (K-1) * ITER_FACTOR
+      - (N-1) = posiciones posibles de corte
+      - (K-1) = cortes a colocar
+      - ITER_FACTOR = factor de exploración (default 5)
+
+    Ejemplos:
+      N=24,  K=3 →  23 *  2 * 5 =   230 iteraciones
+      N=88,  K=7 →  87 *  6 * 5 = 2,610 iteraciones
+      N=89,  K=7 →  88 *  6 * 5 = 2,640 iteraciones
+    """
+    return (n_sentences - 1) * (K - 1) * ITER_FACTOR
+
+
+# ---------------------------------------------------------------------------
+# Barra de progreso
+# ---------------------------------------------------------------------------
+
+def print_progress(
+    iteration: int,
+    max_iter: int,
+    current_score: float,
+    best_score: float,
+    temperature: float,
+    n_improvements: int,
+) -> None:
+    """Imprime una barra de progreso en la misma línea."""
+    pct      = iteration / max_iter
+    bar_len  = 30
+    filled   = int(bar_len * pct)
+    bar      = "█" * filled + "░" * (bar_len - filled)
+    print(
+        f"\r  [{bar}] {pct:>5.1%} | "
+        f"iter={iteration}/{max_iter} | "
+        f"score={current_score:.2f} | "
+        f"best={best_score:.2f} | "
+        f"T={temperature:.3f} | "
+        f"mejoras={n_improvements}",
+        end="",
+        flush=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Funciones auxiliares del SA
+# ---------------------------------------------------------------------------
+
+def size_penalty(segment_size: int) -> float:
+    """
+    Penalización suave por segmentos pequeños.
+
+    Si el segmento tiene menos de MIN_SEGMENT_SIZE oraciones,
+    se descuenta PENALTY_PER_MISSING por cada oración que falta.
+
+    Ejemplos con MIN=3, PENALTY=0.5:
+        tamaño=3 → penalización=0.0  (sin penalización)
+        tamaño=2 → penalización=0.5  (falta 1)
+        tamaño=1 → penalización=1.0  (faltan 2)
+    """
+    if segment_size >= MIN_SEGMENT_SIZE:
+        return 0.0
+    return (MIN_SEGMENT_SIZE - segment_size) * PENALTY_PER_MISSING
+
+
+def compute_partition_score(
+    sentences: list[str],
+    cuts: list[int],
+    changed_segments: list[int] | None = None,
+    score_cache: dict | None = None,
+) -> tuple[float, list[float]]:
+    """
+    Calcula el score total de una partición.
+    Si se especifica changed_segments, solo recalcula esos segmentos
+    y reutiliza los demás del score_cache → minimiza llamadas al LLM.
+    """
+    n          = len(sentences)
+    boundaries = [0] + cuts + [n]
+    K          = len(boundaries) - 1
+    scores     = [0.0] * K
+
+    for i in range(K):
+        if (changed_segments is not None
+                and i not in changed_segments
+                and score_cache
+                and i in score_cache):
+            scores[i] = score_cache[i]
+        else:
+            seg_size   = boundaries[i + 1] - boundaries[i]
+            llm_score  = evaluate_segment(sentences, boundaries[i], boundaries[i + 1])
+            scores[i]  = llm_score - size_penalty(seg_size)
+
+    return sum(scores), scores
+
+
+def get_changed_segments(
+    old_cuts: list[int],
+    new_cuts: list[int],
+    n: int,
+) -> list[int]:
+    """
+    Identifica qué segmentos cambiaron entre dos estados de cortes.
+    Un corte movido en posición i afecta los segmentos i e i+1.
+    """
+    changed        = set()
+    old_boundaries = [0] + old_cuts + [n]
+    new_boundaries = [0] + new_cuts + [n]
+
+    for i, (ob, nb) in enumerate(zip(old_boundaries, new_boundaries)):
+        if ob != nb:
+            if i > 0:
+                changed.add(i - 1)
+            changed.add(i)
+
+    return list(changed)
+
+
+def random_move(cuts: list[int], n: int) -> tuple[list[int], int] | None:
+    """
+    Movimiento aleatorio: desplaza un corte elegido al azar ±1 posición.
+    Retorna (nuevo_estado, índice_del_corte) o None si no hay movimiento válido.
+    """
+    if not cuts:
+        return None
+
+    for _ in range(10):
+        idx       = random.randrange(len(cuts))
+        direction = random.choice([-1, 1])
+        new_pos   = cuts[idx] + direction
+
+        if new_pos < 1 or new_pos >= n:
+            continue
+        if new_pos in cuts:
+            continue
+
+        new_cuts      = cuts[:]
+        new_cuts[idx] = new_pos
+        new_cuts.sort()
+        return new_cuts, idx
+
+    return None
+
+
+def guided_move(
+    sentences: list[str],
+    cuts: list[int],
+    n: int,
+) -> tuple[list[int], int] | None:
+    """
+    Movimiento guiado: el LLM sugiere la dirección para un corte elegido al azar.
+    Retorna (nuevo_estado, índice_del_corte) o None si el LLM dice MANTENER.
+    """
+    if not cuts:
+        return None
+
+    idx        = random.randrange(len(cuts))
+    suggestion = suggest_move(sentences, cuts, cut_index=idx)
+
+    if suggestion == "MANTENER":
+        return None
+
+    direction = -1 if suggestion == "IZQUIERDA" else 1
+    new_pos   = cuts[idx] + direction
+
+    if new_pos < 1 or new_pos >= n or new_pos in cuts:
+        return None
+
+    new_cuts      = cuts[:]
+    new_cuts[idx] = new_pos
+    new_cuts.sort()
+    return new_cuts, idx
+
+
+# ---------------------------------------------------------------------------
+# Algoritmo principal
+# ---------------------------------------------------------------------------
+
+def run_sa(
+    sentences: list[str],
+    K: int,
+    initial_cuts: list[int],
+    temp_initial:   float = TEMP_INITIAL,
+    cooling_rate:   float = COOLING_RATE,
+    iter_factor:    int   = ITER_FACTOR,
+    llm_guide_prob: float = LLM_GUIDE_PROB,
+    verbose:        bool  = True,
+) -> dict:
+    """
+    Ejecuta el Simulated Annealing para encontrar la mejor partición en K segmentos.
+
+    Parámetros:
+        sentences       : lista de oraciones del texto
+        K               : número de segmentos
+        initial_cuts    : cortes iniciales (de la Fase 1)
+        temp_initial    : temperatura inicial
+        cooling_rate    : factor de enfriamiento por iteración
+        iter_factor     : multiplicador para calcular iteraciones automáticamente
+        llm_guide_prob  : probabilidad de movimiento guiado por LLM
+        verbose         : si True, muestra barra de progreso
+
+    Retorna dict con:
+        best_cuts, best_score, best_scores,
+        initial_cuts, initial_score,
+        n_iter, n_llm_guided, n_improvements, n_accepted_worse,
+        history, cache_stats
+    """
+    n        = len(sentences)
+    max_iter = compute_max_iter(n, K)
+
+    current     = initial_cuts[:]
+    temperature = temp_initial
+
+    # Evaluar estado inicial
+    current_score, current_scores = compute_partition_score(sentences, current)
+    score_cache = {i: s for i, s in enumerate(current_scores)}
+
+    best          = current[:]
+    best_score    = current_score
+    best_scores   = current_scores[:]
+    initial_score = current_score
+
+    n_llm_guided     = 0
+    n_improvements   = 0
+    n_accepted_worse = 0
+    history          = [(0, current_score)]
+
+    if verbose:
+        print(f"  Iteraciones calculadas: {max_iter}  "
+              f"(N={n}, K={K}, factor={iter_factor})")
+        print(f"  Score inicial: {current_score:.2f} | Cortes: {current}")
+        print()
+
+    for iteration in range(1, max_iter + 1):
+
+        # Mostrar progreso cada 10 iteraciones
+        if verbose and iteration % 10 == 0:
+            print_progress(iteration, max_iter, current_score, best_score,
+                           temperature, n_improvements)
+
+        # 1. Elegir tipo de movimiento
+        use_guided = random.random() < llm_guide_prob
+        if use_guided:
+            result = guided_move(sentences, current, n)
+            if result is not None:
+                n_llm_guided += 1
+        else:
+            result = random_move(current, n)
+
+        if result is None:
+            temperature *= cooling_rate
+            continue
+
+        new_cuts, _ = result
+
+        # 2. Calcular score solo de segmentos afectados
+        changed = get_changed_segments(current, new_cuts, n)
+        new_score, new_scores = compute_partition_score(
+            sentences, new_cuts,
+            changed_segments=changed,
+            score_cache=score_cache,
+        )
+
+        # 3. Decisión de aceptación
+        delta = new_score - current_score
+
+        if delta > 0:
+            accept = True
+            n_improvements += 1
+        else:
+            prob   = math.exp(delta / temperature) if temperature > 1e-10 else 0.0
+            accept = random.random() < prob
+            if accept:
+                n_accepted_worse += 1
+
+        if accept:
+            current        = new_cuts
+            current_score  = new_score
+            current_scores = new_scores
+            score_cache    = {i: s for i, s in enumerate(current_scores)}
+
+            if current_score > best_score:
+                best        = current[:]
+                best_score  = current_score
+                best_scores = current_scores[:]
+
+        # 4. Historial cada 50 iteraciones
+        if iteration % 50 == 0:
+            history.append((iteration, best_score))
+
+        # 5. Enfriar
+        temperature *= cooling_rate
+
+    if verbose:
+        # Imprimir progreso final en 100%
+        print_progress(max_iter, max_iter, current_score, best_score,
+                       temperature, n_improvements)
+        print()  # salto de línea tras la barra
+
+    return {
+        "best_cuts":        best,
+        "best_score":       best_score,
+        "best_scores":      best_scores,
+        "initial_cuts":     initial_cuts,
+        "initial_score":    initial_score,
+        "n_iter":           max_iter,
+        "n_llm_guided":     n_llm_guided,
+        "n_improvements":   n_improvements,
+        "n_accepted_worse": n_accepted_worse,
+        "history":          history,
+        "cache_stats":      get_cache_stats(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prueba standalone
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("=" * 65)
+    print("PRUEBA FASE 2 — SIMULATED ANNEALING")
+    print("=" * 65)
+
+    for fname in ["dataset.json", "dataset_synthetic.json"]:
+        p = Path(fname)
+        if p.exists():
+            with open(p, encoding="utf-8") as f:
+                dataset = json.load(f)
+            print(f"Dataset: {fname} ({len(dataset)} instancias)")
+            break
+    else:
+        print("ERROR: No se encontró ningún dataset.")
+        exit(1)
+
+    instance  = dataset[0]
+    sentences = instance["sentences"]
+    K         = instance["K"]
+    gt_cuts   = instance["ground_truth_cuts"]
+    n         = instance["n_sentences"]
+
+    print(f"\nInstancia : {instance['title']}")
+    print(f"Oraciones : {n}  |  K={K}  |  GT cuts: {gt_cuts}")
+
+    # Fase 1
+    print(f"\n{'─'*65}")
+    print("Fase 1: calculando cortes iniciales...")
+    ranked       = get_ranked_candidates(sentences, MODEL_B)
+    initial_cuts = get_initial_cuts(ranked, K)
+    print(f"Cortes iniciales: {initial_cuts}")
+
+    # Fase 2
+    print(f"\n{'─'*65}")
+    print("Fase 2: ejecutando Simulated Annealing...")
+    reset_cache()
+    t_start = time.time()
+
+    result  = run_sa(sentences=sentences, K=K, initial_cuts=initial_cuts)
+    elapsed = time.time() - t_start
+
+    # Resultados
+    print(f"\n{'─'*65}")
+    print("RESULTADOS")
+    print(f"{'─'*65}")
+    print(f"Cortes iniciales : {result['initial_cuts']}  (score={result['initial_score']:.2f})")
+    print(f"Mejor partición  : {result['best_cuts']}  (score={result['best_score']:.2f})")
+    print(f"Ground truth     : {gt_cuts}")
+    print(f"Scores por seg.  : {[f'{s:.1f}' for s in result['best_scores']]}")
+    print(f"Mejora obtenida  : {result['best_score'] - result['initial_score']:+.2f}")
+    print(f"Tiempo total     : {elapsed:.1f}s")
+
+    print(f"\n{'─'*65}")
+    print("ESTADÍSTICAS SA")
+    print(f"{'─'*65}")
+    print(f"  Iteraciones totales  : {result['n_iter']}")
+    print(f"  Mejoras aceptadas    : {result['n_improvements']}")
+    print(f"  Peores aceptadas     : {result['n_accepted_worse']}")
+    print(f"  Movimientos LLM      : {result['n_llm_guided']}")
+
+    stats = result["cache_stats"]
+    print(f"\n  Llamadas LLM reales  : {stats['misses']}")
+    print(f"  Cache hits           : {stats['hits']}")
+    print(f"  Tasa de cache        : {stats['hit_rate']:.0%}")
+    print(f"  Llamadas ahorradas   : {stats['llm_calls_saved']}")
+
+    print(f"\n{'─'*65}")
+    best_set = set(result["best_cuts"])
+    gt_set   = set(gt_cuts)
+    exactos  = len(best_set & gt_set)
+    print(f"Cortes exactos vs GT : {exactos}/{len(gt_set)}")
+</file>
+
+<file path="tune_expansion.py">
+"""
+tune_expansion.py
+-----------------
+Encuentra el valor óptimo de expansion para la Fase 1.
+
+Prueba varios valores de expansion y mide el recall promedio
+sobre todo el dataset para ambos modelos.
+
+Uso:
+    python tune_expansion.py
+"""
+
+import json
+from pathlib import Path
+from embeddings import get_cut_candidates, MODEL_A, MODEL_B
+
+
+def evaluate_expansion(dataset: list[dict], model_path: str, model_label: str, expansions: list[int]) -> None:
+    print(f"\n{'─'*60}")
+    print(f"Modelo: {model_label}")
+    print(f"{'─'*60}")
+    print(f"{'Expansion':>10} | {'Recall %':>8} | {'Candidatos promedio':>20} | {'% espacio':>10}")
+    print(f"{'─'*10}-+-{'─'*8}-+-{'─'*20}-+-{'─'*10}")
+
+    for expansion in expansions:
+        recalls = []
+        n_candidates_list = []
+        space_reductions = []
+
+        for instance in dataset:
+            sentences = instance["sentences"]
+            K         = instance["K"]
+            gt_cuts   = set(instance["ground_truth_cuts"])
+            n         = instance["n_sentences"]
+
+            candidates = get_cut_candidates(sentences, K, model_path, expansion=expansion)
+            cand_set   = set(candidates)
+
+            recall = len(gt_cuts & cand_set) / len(gt_cuts) if gt_cuts else 0.0
+            recalls.append(recall)
+            n_candidates_list.append(len(candidates))
+            space_reductions.append(len(candidates) / (n - 1) if n > 1 else 1.0)
+
+        avg_recall     = sum(recalls) / len(recalls)
+        avg_candidates = sum(n_candidates_list) / len(n_candidates_list)
+        avg_space      = sum(space_reductions) / len(space_reductions)
+
+        print(f"{expansion:>10} | {avg_recall*100:>7.1f}% | {avg_candidates:>20.1f} | {avg_space*100:>9.1f}%")
+
+
+if __name__ == "__main__":
+    dataset_path = Path("dataset.json")
+    if not dataset_path.exists():
+        print("ERROR: dataset.json no encontrado.")
+        exit(1)
+
+    with open(dataset_path, encoding="utf-8") as f:
+        dataset = json.load(f)
+
+    print("=" * 60)
+    print("BÚSQUEDA DE EXPANSION ÓPTIMO — FASE 1")
+    print(f"Dataset: {len(dataset)} instancias")
+    print("=" * 60)
+
+    expansions = [2, 3, 4, 5, 6, 8, 10]
+
+    for model_label, model_path in [("Modelo A (MiniLM)", MODEL_A), ("Modelo B (mpnet)", MODEL_B)]:
+        evaluate_expansion(dataset, model_path, model_label, expansions)
+
+    print(f"\n{'─'*60}")
+    print("Interpretación:")
+    print("  Recall    → % de cortes reales capturados (queremos ≥ 80%)")
+    print("  Candidatos → cuántas posiciones pasan al SA (menos = más rápido)")
+    print("  % espacio  → qué fracción del espacio total representan")
+</file>
+
+</files>

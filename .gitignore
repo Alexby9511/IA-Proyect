@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+env/
+venv/
+*.pyc
+dataset_synthetic.json
+dataset.json
+models/

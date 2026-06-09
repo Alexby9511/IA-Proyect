@@ -1,0 +1,4 @@
+wikipedia-api
+nltk
+numpy
+sentence_transformers
