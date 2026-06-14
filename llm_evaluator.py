@@ -2,28 +2,31 @@
 llm_evaluator.py
 ----------------
 Evaluador de cohesión semántica para segmentos de texto.
-Utiliza la API de Cerebras (modelo gpt-oss-120b) con estrategia de
-evaluación en dos fases:
+Utiliza la API de Cerebras (modelo gpt-oss-120b).
 
-  Fase 1 — Prompt suave (PROMPT_SOFT):
-    Evalúa la cohesión general del segmento en escala 1-10.
-    Es permisivo: detecta los casos claramente mezclados (score bajo)
-    y los claramente cohesivos (score alto).
+Arquitectura de selección de modo (Suave vs Estricto):
 
-  Fase 2 — Prompt estricto (PROMPT_STRICT), solo si Fase 1 da score alto:
-    Se aplica ÚNICAMENTE cuando el segmento parece cohesivo (score >= STRICT_THRESHOLD).
-    Busca activamente subtemas ocultos, transiciones sutiles o cambios de
-    énfasis que el prompt suave podría haber ignorado.
-    Si el prompt estricto detecta un cambio, devuelve un score más bajo.
+  Evaluación Inicial (UNA VEZ por ejecución, select_evaluation_mode):
+    Se evalúa el texto completo con PROMPT_SOFT para obtener una
+    puntuación de calidad/coherencia global (0-10).
 
-  El score final es el mínimo de ambas fases cuando se aplican las dos,
-  o el score de la Fase 1 si no se supera el umbral.
+  Condicional de Selección:
+    - Escenario A (score_global >= GLOBAL_SCORE_THRESHOLD, default 8.0):
+      el texto es coherente y estructuralmente sólido. Se usa
+      EXCLUSIVAMENTE el Prompt Estricto (PROMPT_STRICT) para evaluar
+      tanto el texto completo como cada subsegmento, buscando límites
+      finos con precisión.
+    - Escenario B (score_global < GLOBAL_SCORE_THRESHOLD):
+      el texto presenta inconsistencias / es heterogéneo a priori.
+      Se usa EXCLUSIVAMENTE el Prompt Suave (PROMPT_SOFT), más tolerante
+      a digresiones menores, para no sobre-segmentar.
 
-Parámetro clave:
-  STRICT_THRESHOLD = 7.0
-    Si el score suave >= 7.0, se activa la Fase 2 (prompt estricto).
-    Ajustar hacia arriba si el estricto penaliza demasiado textos válidos.
-    Ajustar hacia abajo si queremos más agresividad en la detección.
+  A diferencia del esquema anterior (Fase1 + Fase2 condicional con
+  min(suave, estricto) por cada segmento), el modo se decide UNA SOLA
+  VEZ al inicio y se aplica de forma CONSISTENTE durante toda la
+  ejecución. Esto evita que el prompt estricto (que por diseño tiende a
+  encontrar "un sub-tema" en casi cualquier texto) penalice en cascada
+  bloques que ya son coherentes al nivel de granularidad correcto.
 """
 
 import os
@@ -48,29 +51,34 @@ RETRY_DELAY_BASE = 2.0
 TIMEOUT          = 60
 MAX_TOKENS       = 1000
 
-# Umbral para activar el prompt estricto (Fase 2).
-# Si score_suave >= STRICT_THRESHOLD → se lanza Fase 2.
-STRICT_THRESHOLD = 7.0
+# Umbral de la evaluación inicial (Escenario A vs B).
+# score_global >= GLOBAL_SCORE_THRESHOLD → modo "strict"
+# score_global <  GLOBAL_SCORE_THRESHOLD → modo "soft"
+GLOBAL_SCORE_THRESHOLD = 8.0
 
 # Caché de evaluaciones: clave → score final
 _eval_cache: dict[tuple, float] = {}
 _cache_hits   = 0
 _cache_misses = 0
-_strict_activations = 0   # cuántas veces se activó la Fase 2 (para stats)
+
+# Modo activo para la ejecución actual ("strict" | "soft" | None)
+# y score de la evaluación inicial que lo determinó.
+_active_mode: str | None = None
+_global_score: float | None = None
 
 
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
-# Fase 1: evaluación general, permisiva.
-# Identifica claramente los extremos (muy mezclado vs muy cohesivo).
-PROMPT_SOFT = """Analyze the following text and rate its thematic coherence from 1 to 10.
+# Prompt Suave: enfocado en flexibilidad, permite inferencias ligeras
+# cuando la estructura no es obvia.
+PROMPT_SOFT = """Analyze the following text and rate its broader thematic coherence from 1 to 10.
 
-- 1-3: The text mixes completely unrelated topics (e.g., biology + Roman history + astronomy in the same paragraph).
-- 4-6: The text has a general theme but includes noticeable digressions or shifts in focus.
-- 7-9: The text is mostly about one topic, with minor transitions or elaborations.
-- 10: The text is perfectly homogeneous — all sentences describe the exact same concept or process without any shift.
+- 1-3: The text abruptly mixes completely different major categories (e.g., History of a discovery mixed with detailed chemical equations, or astronomy mixed with biology).
+- 4-6: The text has a general theme but includes noticeable structural shifts (e.g., finishing a historical intro and starting a technical deep-dive).
+- 7-9: The text is mostly about one overarching topic, even if it progresses naturally through related sub-points or a timeline.
+- 10: The text is perfectly cohesive and belongs to a single logical block.
 
 Text:
 {texto}
@@ -78,26 +86,23 @@ Text:
 Put your reasoning inside <think></think> tags. Output your final score exactly as: [SCORE: X.X]"""
 
 
-# Fase 2: evaluación estricta, activada solo cuando Fase 1 da score alto.
-# Busca activamente subtemas ocultos que el prompt suave pudo ignorar.
-PROMPT_STRICT = """You are a ruthless text segmentation algorithm. Your job is to find reasons to CUT this text.
+# Prompt Estricto: Diferencia entre flujo narrativo y saltos de sub-procesos.
+PROMPT_STRICT = """You are an advanced text segmentation algorithm. Your job is to detect SHIFTS in specific sub-topics to determine if a text should be CUT.
 
-The text has already been classified as generally cohesive. Your task is to look harder:
-- Does the text TRANSITION between different sub-topics? (e.g., from a general theory to a specific experiment, from one historical period to another, from one author to another)
-- Does the focus SHIFT even slightly? (e.g., from macroscopic biology to molecular chemistry)
-- Are there sentences that would more naturally belong to a DIFFERENT section?
+Evaluate the text focusing on functional and thematic boundaries:
+1. Distinguish chronological flow from topic shifts: A timeline of scientists making discoveries about the SAME concept is ONE cohesive topic. Do not cut just because the name or year changes.
+2. Beware of jargon repetition: Just because technical words (e.g., 'electrons', 'ATP', 'light') repeat, does not mean it is a single topic. If the text shifts from describing 'Structure' to 'Process A' to 'Process B', these are different sub-topics and MUST be cut.
+3. Look for abrupt category changes (e.g., jumping from History to Cellular Anatomy).
 
 Rules:
-- Score 9.0-10.0 ONLY if the text is 100% homogeneous with zero thematic shift.
-- Score 5.0-8.0 if there is a subtle but detectable shift in focus or sub-topic.
-- Score 1.0-4.0 if there is a clear transition between different sub-topics.
+- Score 9.0-10.0 ONLY if the text discusses a SINGLE specific sub-topic or represents a continuous, unbroken narrative (like a single historical timeline).
+- Score 5.0-8.0 if there is a subtle shift to a new sub-process or structural category.
+- Score 1.0-4.0 if there is a clear boundary (e.g., History ends, Anatomy begins; or Process A ends, Process B begins).
 
 Text:
 {texto}
 
 Put your reasoning inside <think></think> tags. Output your final decision exactly as: [SCORE: X.X]"""
-
-
 # ---------------------------------------------------------------------------
 # Llamada a la API de Cerebras
 # ---------------------------------------------------------------------------
@@ -131,7 +136,7 @@ def _call_llm(prompt: str) -> str:
                 continue
 
             response.raise_for_status()
-            data    = response.json()
+            data = response.json()
 
             if "choices" not in data or len(data["choices"]) == 0:
                 raise ValueError(f"Respuesta sin choices: {data}")
@@ -166,12 +171,10 @@ def _parse_score(response: str) -> float:
     Extrae el score numérico de la respuesta del LLM.
     Busca primero el formato [SCORE: X.X], luego números sueltos.
     """
-    # Formato preferido: [SCORE: X.X]
     match = re.search(r'\[SCORE:\s*([0-9]*\.?[0-9]+)\]', response, re.IGNORECASE)
     if match:
         return float(match.group(1))
 
-    # Fallback: último número en la respuesta (sin el bloque <think>)
     clean = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
     numbers = re.findall(r'\b(10(?:\.0)?|[1-9](?:\.[0-9])?)\b', clean)
     if numbers:
@@ -190,26 +193,60 @@ def _make_cache_key(sentences: list[str], start: int, end: int) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Evaluación principal en dos fases
+# Selección de modo (Evaluación Inicial)
+# ---------------------------------------------------------------------------
+
+def select_evaluation_mode(sentences: list[str]) -> tuple[str, float]:
+    """
+    Evaluación Inicial: analiza el texto completo con PROMPT_SOFT para
+    obtener una puntuación de calidad/coherencia global (0-10) y decide
+    qué prompt usar de forma EXCLUSIVA durante el resto de la ejecución:
+
+      score_global >= GLOBAL_SCORE_THRESHOLD → modo "strict"
+      score_global <  GLOBAL_SCORE_THRESHOLD → modo "soft"
+
+    El modo queda activo (_active_mode) hasta el próximo reset_cache().
+    Esta llamada cuenta como 1 invocación al LLM (no usa caché, ya que
+    es una evaluación de calidad separada de las evaluaciones de
+    segmentos individuales que hace evaluate_segment).
+    """
+    global _active_mode, _global_score
+
+    n = len(sentences)
+    text_content = " ".join(sentences[0:n])
+
+    print(f"  [LLM] Evaluación inicial de calidad (00 -> {n:02d})...", end=" ", flush=True)
+    try:
+        response = _call_llm(PROMPT_SOFT.format(texto=text_content))
+        score = _parse_score(response)
+    except RuntimeError:
+        score = 5.0
+
+    mode = "strict" if score >= GLOBAL_SCORE_THRESHOLD else "soft"
+    print(f"score_global={score:.1f} (umbral={GLOBAL_SCORE_THRESHOLD}) → modo='{mode}'")
+
+    _active_mode  = mode
+    _global_score = score
+    return mode, score
+
+
+# ---------------------------------------------------------------------------
+# Evaluación de segmentos (modo único, decidido por select_evaluation_mode)
 # ---------------------------------------------------------------------------
 
 def evaluate_segment(sentences: list[str], start: int, end: int) -> float:
     """
-    Evalúa la cohesión de un segmento en dos fases:
+    Evalúa la cohesión de un segmento usando EXCLUSIVAMENTE el prompt
+    correspondiente al modo activo (_active_mode), fijado por
+    select_evaluation_mode() para toda la ejecución.
 
-      Fase 1 (siempre): PROMPT_SOFT → score_suave
-      Fase 2 (condicional): PROMPT_STRICT si score_suave >= STRICT_THRESHOLD
-
-    Score final:
-      - Si solo Fase 1: score_suave
-      - Si ambas fases: min(score_suave, score_estricto)
-        → el más conservador gana; si el estricto detecta subtemas
-          ocultos, el score baja aunque el suave fuera alto.
+    Si no se llamó select_evaluation_mode() previamente, se usa "soft"
+    por defecto (comportamiento conservador).
 
     Usa caché para evitar llamadas repetidas al LLM.
-    Devuelve 5.0 si ambas fases fallan.
+    Devuelve 5.0 si la llamada falla.
     """
-    global _cache_hits, _cache_misses, _strict_activations
+    global _cache_hits, _cache_misses
 
     if start >= end:
         return 0.0
@@ -222,50 +259,33 @@ def evaluate_segment(sentences: list[str], start: int, end: int) -> float:
     _cache_misses += 1
     text_content = " ".join(sentences[start:end])
 
-    # --- Fase 1: prompt suave ---
-    print(f"  [LLM] Evaluando ({start:02d} -> {end:02d}) Fase1...", end=" ", flush=True)
+    mode = _active_mode or "soft"
+    prompt_template = PROMPT_STRICT if mode == "strict" else PROMPT_SOFT
+
+    print(f"  [LLM] Evaluando ({start:02d} -> {end:02d}) [{mode}]...", end=" ", flush=True)
     try:
-        response_soft = _call_llm(PROMPT_SOFT.format(texto=text_content))
-        score_soft    = _parse_score(response_soft)
-        print(f"score_suave={score_soft:.1f}", end="", flush=True)
+        response = _call_llm(prompt_template.format(texto=text_content))
+        score = _parse_score(response)
+        print(f"score={score:.1f}")
     except RuntimeError as e:
-        print(f"FALLO Fase1 → 5.0")
-        _eval_cache[key] = 5.0
-        return 5.0
+        print(f"FALLO ({e}) → 5.0")
+        score = 5.0
 
-    # --- Fase 2: prompt estricto (solo si score_suave es alto) ---
-    if score_soft >= STRICT_THRESHOLD:
-        _strict_activations += 1
-        print(f" | Fase2...", end=" ", flush=True)
-        try:
-            response_strict = _call_llm(PROMPT_STRICT.format(texto=text_content))
-            score_strict    = _parse_score(response_strict)
-            print(f"score_estricto={score_strict:.1f}", end="", flush=True)
-            # El score final es el más conservador de los dos
-            score_final = min(score_soft, score_strict)
-        except RuntimeError as e:
-            print(f"FALLO Fase2 → usando score_suave", end="", flush=True)
-            score_final = score_soft
-    else:
-        score_final = score_soft
-
-    print(f" → final={score_final:.1f}")
-
-    _eval_cache[key] = score_final
-    return score_final
+    _eval_cache[key] = score
+    return score
 
 
 # ---------------------------------------------------------------------------
-# Funciones de compatibilidad (usadas por dp_segmentation.py)
+# Funciones de compatibilidad (sin uso activo en el pipeline principal)
 # ---------------------------------------------------------------------------
 
 def suggest_move(sentences: list[str], cuts: list[int], cut_index: int) -> str:
-    """Stub de compatibilidad. Sin uso activo en el pipeline principal."""
+    """Stub de compatibilidad."""
     return "MANTENER"
 
 
 def judge_boundary(sentences: list[str], cut: int, window: int = 3) -> bool:
-    """Stub de compatibilidad. Sin uso activo en el pipeline principal."""
+    """Stub de compatibilidad."""
     return True
 
 
@@ -274,22 +294,24 @@ def judge_boundary(sentences: list[str], cut: int, window: int = 3) -> bool:
 # ---------------------------------------------------------------------------
 
 def reset_cache() -> None:
-    global _eval_cache, _cache_hits, _cache_misses, _strict_activations
+    global _eval_cache, _cache_hits, _cache_misses, _active_mode, _global_score
     _eval_cache.clear()
-    _cache_hits          = 0
-    _cache_misses        = 0
-    _strict_activations  = 0
+    _cache_hits   = 0
+    _cache_misses = 0
+    _active_mode  = None
+    _global_score = None
 
 
 def get_cache_stats() -> dict:
     total    = _cache_hits + _cache_misses
     hit_rate = (_cache_hits / total) if total > 0 else 0.0
     return {
-        "hits":               _cache_hits,
-        "misses":             _cache_misses,
-        "hit_rate":           hit_rate,
-        "strict_activations": _strict_activations,
-        "llm_calls_saved":    _cache_hits,
+        "hits":            _cache_hits,
+        "misses":          _cache_misses,
+        "hit_rate":        hit_rate,
+        "llm_calls_saved": _cache_hits,
+        "evaluation_mode": _active_mode,
+        "global_score":    _global_score,
     }
 
 
@@ -298,15 +320,11 @@ def get_cache_stats() -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import json
-    from pathlib import Path
-
     print("=" * 65)
-    print("PRUEBA LLM — Evaluación en dos fases (Cerebras)")
-    print(f"STRICT_THRESHOLD = {STRICT_THRESHOLD}")
+    print("PRUEBA LLM — Selección de modo + evaluación (Cerebras)")
+    print(f"GLOBAL_SCORE_THRESHOLD = {GLOBAL_SCORE_THRESHOLD}")
     print("=" * 65)
 
-    # Test de conexión
     print("\nTest de conexión...")
     try:
         resp = _call_llm("Reply with exactly: [SCORE: 7.0]")
@@ -315,7 +333,6 @@ if __name__ == "__main__":
         print(f"  FALLO: {e}")
         exit(1)
 
-    # Textos de prueba
     COHESIVE = [
         "La fotosíntesis es el proceso por el cual las plantas convierten luz solar en energía química.",
         "Las plantas capturan la luz mediante la clorofila, un pigmento verde presente en los cloroplastos.",
@@ -332,34 +349,9 @@ if __name__ == "__main__":
         "Roma fundó instituciones que influyeron profundamente en el derecho y la cultura occidentales.",
     ]
 
-    SUBTLE = [
-        "A Sachs se debe la formulación de la ecuación básica de la fotosíntesis: 6 CO2 + 6 H2O → C6H12O6 + 6 O2.",
-        "Andreas Franz Wilhelm Schimper daría el nombre de cloroplastos a los cuerpos coloreados de Sachs.",
-        "En el último tercio del siglo XIX se sucederían los esfuerzos por establecer las propiedades físico-químicas de las clorofilas.",
-        "En 1905, Frederick Frost Blackman midió la velocidad a la que se produce la fotosíntesis en diferentes condiciones.",
-        "Los cloroplastos están delimitados por una envoltura formada por dos membranas llamadas envueltas.",
-    ]
-
-    print("\n[1/3] Segmento COHESIVO (fotosíntesis pura):")
-    s1 = evaluate_segment(COHESIVE, 0, len(COHESIVE))
-    print(f"      Score final: {s1:.1f}/10  (esperado: 7-10)")
-
-    print("\n[2/3] Segmento MEZCLADO (fotosíntesis + Roma + astronomía):")
-    s2 = evaluate_segment(MIXED, 0, len(MIXED))
-    print(f"      Score final: {s2:.1f}/10  (esperado: 1-4)")
-
-    print("\n[3/3] Segmento SUTIL (historia de la fotosíntesis — subtemas cercanos):")
-    s3 = evaluate_segment(SUBTLE, 0, len(SUBTLE))
-    print(f"      Score final: {s3:.1f}/10  (esperado: 5-8)")
-
-    print(f"\n{'─'*65}")
-    stats = get_cache_stats()
-    print(f"Llamadas LLM reales    : {stats['misses']}")
-    print(f"  de las cuales Fase 2 : {stats['strict_activations']}")
-    print(f"Cache hits             : {stats['hits']}")
-    diff = s1 - s2
-    print(f"\nDiferencia cohesivo - mezclado: {diff:.1f}")
-    if diff >= 3:
-        print("✓ El sistema distingue bien.")
-    else:
-        print("⚠ Diferencia baja. Revisar STRICT_THRESHOLD o prompts.")
+    for label, sample in [("COHESIVO", COHESIVE), ("MEZCLADO", MIXED)]:
+        reset_cache()
+        print(f"\n--- {label} ---")
+        mode, gscore = select_evaluation_mode(sample)
+        score = evaluate_segment(sample, 0, len(sample))
+        print(f"  modo='{mode}' | score_global={gscore:.1f} | score_segmento={score:.1f}")

@@ -45,6 +45,7 @@ FIELDNAMES = [
     "F1_tol1", "Precision_tol1", "Recall_tol1",
     "time_sec", "llm_calls", "cache_hit_rate",
     "edges_total", "edges_pruned_length", "edges_pruned_cohesion", "edges_evaluated_llm",
+    "evaluation_mode", "global_score",
 ]
 
 
@@ -130,6 +131,8 @@ def run_all(quick: bool = False) -> None:
                         "edges_pruned_length":   dp_stats.get("edges_pruned_length", 0),
                         "edges_pruned_cohesion": dp_stats.get("edges_pruned_cohesion", 0),
                         "edges_evaluated_llm":   dp_stats.get("edges_evaluated_llm", 0),
+                        "evaluation_mode":       dp_stats.get("evaluation_mode"),
+                        "global_score":          dp_stats.get("global_score"),
                     })
                     print(f"K={res['best_K']} F1={f1_0:.3f} ({elapsed:.1f}s)")
 

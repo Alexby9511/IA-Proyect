@@ -28,7 +28,7 @@ Integración con llm_evaluator (dos fases):
 from __future__ import annotations
 import numpy as np
 from embeddings import cosine_similarity, compute_similarity_profile, find_local_valleys
-from llm_evaluator import evaluate_segment
+from llm_evaluator import evaluate_segment, select_evaluation_mode, GLOBAL_SCORE_THRESHOLD
 
 
 def _find_best_valley_in_range(
@@ -124,74 +124,90 @@ def _recursive_segment(
 
 
 def run_dp_segmentation(
-    sentences: list[str],
-    embeddings: np.ndarray,
-    min_seg: int = 3,
-    **kwargs,
+  sentences: list[str],
+  embeddings: np.ndarray,
+  min_seg: int = 3,
+  **kwargs,
 ) -> tuple[list[int], dict]:
-    """
-    Función principal del motor de segmentación.
+  """
+  Función principal del motor de segmentación.
 
-    Flujo:
-      1. Precomputar perfil de similitud y valles globales (una sola vez).
-      2. Evaluar el texto completo con el LLM.
-      3. Si cohesivo → devolver sin cortes.
-         Si mezclado → iniciar recursión con búsqueda binaria guiada.
+  Flujo:
+    0. Evaluación Inicial: select_evaluation_mode() puntúa la calidad/
+     coherencia global del texto (0-10) y fija el modo de prompt
+     ("strict" si score_global >= GLOBAL_SCORE_THRESHOLD, "soft" en
+     caso contrario) para TODA la ejecución.
+    1. Precomputar perfil de similitud y valles globales (una sola vez).
+    2. Evaluar el texto completo con el LLM, usando el modo ya fijado.
+    3. Si cohesivo (score >= score_threshold) → devolver sin cortes.
+     Si mezclado → iniciar recursión con búsqueda binaria guiada,
+     donde TODOS los subsegmentos se evalúan con el mismo modo.
 
-    Parámetros kwargs:
-      score_threshold : umbral de cohesión para parar recursión (default 7.0)
-                        Valores más altos → más agresivo (más cortes).
-                        Valores más bajos → más conservador (menos cortes).
+  Parámetros kwargs:
+    score_threshold : umbral de cohesión para parar la recursión
+            (default 7.0). Es independiente de
+            GLOBAL_SCORE_THRESHOLD (que decide el modo de
+            prompt); score_threshold decide cuándo dejar de
+            dividir un bloque.
 
-    Retorna:
-      (cortes_finales, estadísticas)
-    """
-    n               = len(sentences)
-    score_threshold = kwargs.get("score_threshold", 7.0)
+  Retorna:
+    (cortes_finales, estadísticas)
+  """
+  n               = len(sentences)
+  score_threshold = kwargs.get("score_threshold", 7.0)
 
-    stats = {
-        "edges_evaluated_llm":   0,
-        "edges_total":           0,
-        "edges_pruned_length":   0,
-        "edges_pruned_cohesion": 0,
-    }
+  stats = {
+    "edges_evaluated_llm":   0,
+    "edges_total":           0,
+    "edges_pruned_length":   0,
+    "edges_pruned_cohesion": 0,
+    "evaluation_mode":       None,
+    "global_score":          None,
+  }
 
-    # 1. Precomputar valles globales UNA SOLA VEZ
-    similarities = compute_similarity_profile(embeddings)
-    raw_valleys  = find_local_valleys(similarities)
-    # idx en similarities → corte en posición idx+1
-    valley_cuts  = [(idx + 1, depth) for idx, depth in raw_valleys]
+  # 0. Evaluación Inicial: decide el modo de prompt para toda la ejecución
+  mode, global_score = select_evaluation_mode(sentences)
+  stats["evaluation_mode"] = mode
+  stats["global_score"]    = global_score
+  stats["edges_evaluated_llm"] += 1
+  print(f"  [DP] Escenario {'A (estricto)' if mode == 'strict' else 'B (suave)'}: "
+      f"score_global={global_score:.1f} (umbral={GLOBAL_SCORE_THRESHOLD}) → modo='{mode}'")
 
-    print(f"  [DP] Valles precomputados (por profundidad): "
-          f"{[pos for pos, _ in valley_cuts]}")
-    print(f"  [DP] score_threshold={score_threshold} | min_seg={min_seg}")
+  # 1. Precomputar valles globales UNA SOLA VEZ
+  similarities = compute_similarity_profile(embeddings)
+  raw_valleys  = find_local_valleys(similarities)
+  valley_cuts  = [(idx + 1, depth) for idx, depth in raw_valleys]
 
-    # 2. Evaluación inicial del texto completo
-    stats["edges_evaluated_llm"] += 1
-    score_total = evaluate_segment(sentences, 0, n)
+  print(f"  [DP] Valles precomputados (por profundidad): "
+      f"{[pos for pos, _ in valley_cuts]}")
+  print(f"  [DP] score_threshold={score_threshold} | min_seg={min_seg}")
 
-    if score_total >= score_threshold:
-        print(f"  [DP] Texto completo cohesivo (score={score_total:.1f}) → sin cortes")
-        stats["edges_total"] = stats["edges_evaluated_llm"]
-        return [], stats
+  # 2. Evaluación inicial del texto completo, con el modo ya fijado
+  stats["edges_evaluated_llm"] += 1
+  score_total = evaluate_segment(sentences, 0, n)
 
-    # 3. Texto mezclado → recursión con búsqueda binaria
-    print(f"  [DP] Texto mezclado (score={score_total:.1f}) → iniciando segmentación recursiva...")
-    final_cuts = _recursive_segment(
-        sentences       = sentences,
-        embeddings      = embeddings,
-        start           = 0,
-        end             = n,
-        min_seg         = min_seg,
-        score_threshold = score_threshold,
-        valley_cuts     = valley_cuts,
-        stats           = stats,
-        depth           = 0,
-    )
-
+  if score_total >= score_threshold:
+    print(f"  [DP] Texto completo cohesivo (score={score_total:.1f}) → sin cortes")
     stats["edges_total"] = stats["edges_evaluated_llm"]
+    return [], stats
 
-    print(f"  [DP] Segmentación completada. Cortes: {final_cuts} "
-          f"| LLM calls: {stats['edges_evaluated_llm']}")
+  # 3. Texto mezclado → recursión con búsqueda binaria, modo consistente
+  print(f"  [DP] Texto mezclado (score={score_total:.1f}) → iniciando segmentación recursiva...")
+  final_cuts = _recursive_segment(
+    sentences       = sentences,
+    embeddings      = embeddings,
+    start           = 0,
+    end             = n,
+    min_seg         = min_seg,
+    score_threshold = score_threshold,
+    valley_cuts     = valley_cuts,
+    stats           = stats,
+    depth           = 0,
+  )
 
-    return sorted(set(final_cuts)), stats
+  stats["edges_total"] = stats["edges_evaluated_llm"]
+
+  print(f"  [DP] Segmentación completada. Cortes: {final_cuts} "
+      f"| LLM calls: {stats['edges_evaluated_llm']} | modo='{mode}'")
+
+  return sorted(set(final_cuts)), stats

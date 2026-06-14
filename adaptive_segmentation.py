@@ -126,15 +126,14 @@ def main():
     print(f"Llamadas LLM     : {result['total_llm_calls']}")
 
     dp_stats = result.get("dp_stats", {})
-    cache_stats = result.get("cache_stats", {})
     if dp_stats:
         print(f"\nAristas totales      : {dp_stats['edges_total']}")
         print(f"  podadas (longitud) : {dp_stats['edges_pruned_length']}")
         print(f"  podadas (cohesión) : {dp_stats['edges_pruned_cohesion']}")
         print(f"  evaluadas con LLM  : {dp_stats['edges_evaluated_llm']}")
-    if cache_stats:
-        print(f"  respuestas truncadas (<think> sin cerrar): "
-              f"{cache_stats.get('truncated', 0)} / {dp_stats.get('edges_evaluated_llm', 0)}")
+        if dp_stats.get("evaluation_mode"):
+            print(f"  modo de evaluación : '{dp_stats['evaluation_mode']}' "
+                  f"(score_global={dp_stats.get('global_score', 0):.1f})")
 
     if gt_cuts:
         f1, p, r = compute_f1(result["best_cuts"], gt_cuts, tolerance=1)
