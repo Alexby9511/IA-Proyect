@@ -2,10 +2,7 @@
 test_prompts.py
 ---------------
 Prueba 3 estilos de prompt distintos para encontrar cuál hace que
-mi-llama:latest distinga entre texto cohesivo y texto mezclado.
-
-Uso:
-    python test_prompts.py
+deepseek-local:1.5b distinga entre texto cohesivo y texto mezclado.
 """
 
 import re
@@ -13,7 +10,7 @@ import requests
 import time
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL      = "mi-llama:latest"
+MODEL      = "deepseek-local:1.5b"
 
 # ---------------------------------------------------------------------------
 # Textos de prueba
@@ -43,30 +40,58 @@ PROMPTS = {
     "A — Pregunta directa con escala": (
         "En una escala del 1 al 10, ¿qué tan cohesionado temáticamente es este texto?\n"
         "1 = trata varios temas sin relación. 10 = trata un único tema de principio a fin.\n"
-        "Responde SOLO con el número.\n\n"
+        "Responde SOLO con el número al final.\n\n"
         "Texto: {texto}\n\n"
         "Puntuación:"
     ),
-    "B — Pregunta binaria primero, luego número": (
-        "Lee este texto y decide:\n"
-        "¿Todas las oraciones tratan el MISMO tema? (sí/no)\n"
-        "Luego da una puntuación de cohesión del 1 al 10.\n"
-        "Formato de respuesta: [sí/no] [número]\n\n"
+    "B — Explicación breve y escala": (
+        "Lee este texto y evalúa si trata un solo tema o mezcla varios.\n"
+        "Piensa brevemente en tu decisión y luego da una puntuación del 1 al 10.\n"
+        "1 = Temas mezclados, 10 = Un solo tema coherente.\n\n"
         "Texto: {texto}\n\n"
         "Respuesta:"
     ),
-    "C — Instrucción en inglés (modelos pequeños responden mejor)": (
+    "C — Instrucción en inglés (recomendado)": (
         "Rate the thematic coherence of this text from 1 to 10.\n"
         "1 = completely unrelated topics mixed together.\n"
         "10 = all sentences discuss exactly the same topic.\n"
-        "Reply with ONLY a single number.\n\n"
+        "Briefly explain your reasoning, then reply with the final number.\n\n"
+        "Text: {texto}\n\n"
+        "Score:"
+    ),
+    "D — Strict role and constraint": (
+        "You are an expert text analyzer. Your task is to rate the thematic cohesion of the text.\n"
+        "Rules:\n"
+        "- If the text discusses a SINGLE topic consistently, score it 10.\n"
+        "- If the text abruptly switches topics or mixes completely unrelated subjects, score it 1.\n"
+        "Briefly explain your thought process, then output the final score.\n\n"
+        "Text: {texto}\n\n"
+        "Score:"
+    ),
+    "E — Few-shot examples (Highly Recommended)": (
+        "Rate the thematic cohesion from 1 (mixed topics) to 10 (single topic).\n\n"
+        "Example 1:\n"
+        "Text: The sun is a star. Cars need fuel to run. Water freezes at zero degrees.\n"
+        "Score: 1\n\n"
+        "Example 2:\n"
+        "Text: Mitochondria is the powerhouse of the cell. It generates most of the cell's supply of ATP, used as a source of chemical energy.\n"
+        "Score: 10\n\n"
+        "Now rate this text.\n"
+        "Text: {texto}\n\n"
+        "Score:"
+    ),
+    "F — Chain of Thought trigger": (
+        "Determine if the following text is thematically cohesive (discusses one topic) or mixed (discusses multiple unrelated topics).\n"
+        "Step 1: Identify the main topics.\n"
+        "Step 2: Decide if they are related or completely different.\n"
+        "Step 3: Assign a score (10 for purely cohesive, 1 for heavily mixed).\n\n"
         "Text: {texto}\n\n"
         "Score:"
     ),
 }
 
-
-def call_llm(prompt: str, num_predict: int = 10) -> str:
+def call_llm(prompt: str, num_predict: int = 300) -> str:
+    """Aumentamos num_predict a 300 para darle espacio a la fase de <think>"""
     payload = {
         "model": MODEL,
         "prompt": prompt,
@@ -85,13 +110,26 @@ def call_llm(prompt: str, num_predict: int = 10) -> str:
 
 
 def parse_score(response: str) -> float:
-    numbers = re.findall(r'\b(10|[1-9])\b', response)
+    """Extrae el número final ignorando la fase de pensamiento."""
+    
+    # Si empezó a pensar pero nunca terminó, la respuesta está truncada
+    if "<think>" in response and "</think>" not in response:
+        print(" [!] Respuesta truncada por num_predict")
+        return -1.0
+        
+    # Borrar todo el bloque de razonamiento
+    clean_text = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+    
+    # Buscar números (del 1 al 10) en la respuesta limpia
+    numbers = re.findall(r'\b(10|[1-9])\b', clean_text)
     if numbers:
-        return float(numbers[0])
-    digits = re.findall(r'\d', response)
+        return float(numbers[-1]) # Tomamos el último número emitido
+    
+    digits = re.findall(r'\d', clean_text)
     if digits:
-        return float(min(10, max(1, int(digits[0]))))
-    return -1.0  # -1 indica que no se encontró número
+        return float(min(10, max(1, int(digits[-1]))))
+        
+    return -1.0 
 
 
 def run_tests():
@@ -103,16 +141,24 @@ def run_tests():
 
     for prompt_name, prompt_template in PROMPTS.items():
         print(f"\n{'─'*65}")
-        print(f"Prompt {prompt_name}")
+        print(f"Prompt: {prompt_name}")
         print(f"{'─'*65}")
 
         for label, text in [("COHESIVO", COHESIVE_TEXT), ("MEZCLADO", MIXED_TEXT)]:
             prompt = prompt_template.format(texto=text)
             try:
-                response, elapsed = call_llm(prompt, num_predict=15)
+                # Le damos 300 tokens para que pueda pensar y responder
+                response, elapsed = call_llm(prompt, num_predict=300)
                 score = parse_score(response)
-                status = f"{score:.0f}/10" if score >= 0 else "NO NÚMERO"
-                print(f"  {label:<10}: '{response[:40]}' → {status}  ({elapsed:.1f}s)")
+                
+                status = f"{score:.0f}/10" if score >= 0 else "FALLO/TRUNCADO"
+                
+                # Mostrar un fragmento de la respuesta limpia para debug
+                clean_preview = re.sub(r'<think>.*?</think>', '[PENSAMIENTO OCULTO]', response, flags=re.DOTALL).replace('\n', ' ')
+                
+                print(f"  {label:<10}: {status} ({elapsed:.1f}s)")
+                print(f"  ↳ Raw: {clean_preview[:80]}...")
+                
                 results.setdefault(prompt_name, {})[label] = score
             except Exception as e:
                 print(f"  {label:<10}: ERROR — {e}")
@@ -144,14 +190,10 @@ def run_tests():
     print()
     if best_diff >= 3:
         print(f"✓ Prompt '{best_prompt}' funciona bien (diff={best_diff:.1f}).")
-        print("  Actualiza EVAL_PROMPT en llm_evaluator.py con ese prompt.")
     elif best_diff >= 1:
         print(f"⚠ Prompt '{best_prompt}' distingue poco (diff={best_diff:.1f}).")
-        print("  Considera bajar llm_weight a 0.1-0.2.")
     else:
         print("✗ Ningún prompt funciona bien con este modelo.")
-        print("  Recomendación: usar llm_weight=0.0 o cambiar de modelo.")
-
 
 if __name__ == "__main__":
     run_tests()

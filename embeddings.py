@@ -58,12 +58,6 @@ def get_ranked_candidates(
     sentences: list[str],
     model_path: str,
 ) -> list[tuple[int, float]]:
-    """
-    Devuelve TODAS las posiciones posibles de corte ordenadas
-    de más a menos prometedora (menor similitud = mejor candidato).
-    Retorna lista de tuplas (posición, similitud) ordenada ascendentemente.
-    Posición i significa corte entre oración i-1 e i.
-    """
     n = len(sentences)
     if n < 2:
         return []
@@ -77,20 +71,10 @@ def get_initial_cuts(
     ranked_candidates: list[tuple[int, float]],
     K: int,
 ) -> list[int]:
-    """
-    Selecciona los K-1 mejores candidatos como estado inicial para el SA.
-    Retorna lista ordenada de K-1 posiciones de corte.
-    """
     best = ranked_candidates[:K - 1]
     return sorted([pos for pos, _ in best])
 
 def find_local_valleys(similarities: list[float]) -> list[tuple[int, float]]:
-    """
-    Encuentra todos los mínimos locales estrictos en el perfil de similitud.
-    Retorna lista de (índice, profundidad) ordenada por profundidad descendente.
-    La profundidad se calcula como la diferencia entre la similitud en el valle
-    y el máximo de sus vecinos inmediatos.
-    """
     if len(similarities) < 3:
         return []
     sim_arr = np.array(similarities)
@@ -103,13 +87,7 @@ def find_local_valleys(similarities: list[float]) -> list[tuple[int, float]]:
     valleys.sort(key=lambda x: x[1], reverse=True)
     return valleys
 
-# ---------------------------------------------------------------------------
-# Evaluación agregada (para pruebas)
-# ---------------------------------------------------------------------------
-def evaluate_recall(
-    dataset: list[dict],
-    model_path: str,
-) -> dict:
+def evaluate_recall(dataset: list[dict], model_path: str) -> dict:
     recalls_k, recalls_2k = [], []
     for instance in dataset:
         sentences = instance["sentences"]
@@ -125,9 +103,6 @@ def evaluate_recall(
         "recall_2k": sum(recalls_2k) / len(recalls_2k),
     }
 
-# ---------------------------------------------------------------------------
-# Prueba standalone
-# ---------------------------------------------------------------------------
 def test_instance(instance: dict, model_path: str, model_label: str) -> None:
     sentences = instance["sentences"]
     K = instance["K"]

@@ -1,5 +1,8 @@
+# requirements.txt actualizado
 numpy
 sentence-transformers
 scipy
 requests
 wikipedia-api
+python-dotenv
+cerebras-cloud-sdk

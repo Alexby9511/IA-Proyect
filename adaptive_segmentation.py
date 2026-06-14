@@ -3,7 +3,7 @@ adaptive_segmentation.py
 -----------------------
 Funciones reutilizables para segmentación de texto:
 tokenización, cohesión de segmentos, scoring de embeddings,
-métrica F1 y CLI simple que invoca el pipeline principal.
+métrica F1 y CLI que invoca el pipeline avanzado.
 
 Uso:
   python adaptive_segmentation.py --dataset dataset.json --index 0
@@ -31,7 +31,7 @@ def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in parts if len(s.split()) >= 5]
 
 # ---------------------------------------------------------------------------
-# Cohesión de un segmento
+# Cohesión de un segmento (basada en embeddings)
 # ---------------------------------------------------------------------------
 def segment_cohesion(embeddings: np.ndarray, start: int, end: int) -> float:
     seg = embeddings[start:end]
@@ -40,61 +40,6 @@ def segment_cohesion(embeddings: np.ndarray, start: int, end: int) -> float:
     centroid = seg.mean(axis=0)
     sims = [cosine_similarity(emb, centroid) for emb in seg]
     return float(np.mean(sims))
-
-# ---------------------------------------------------------------------------
-# Cohesión por segmento de una partición (función compartida)
-# ---------------------------------------------------------------------------
-def compute_segment_cohesions(embeddings: np.ndarray, cuts: list[int], n: int) -> list[float]:
-    """
-    Calcula la cohesión (0-1) de cada segmento de una partición.
-
-    Esta función se comparte entre score_partition_embeddings (aquí) y
-    compute_partition_score_embeddings (simulated_annealing.py), que la
-    usa como función de coste dentro del bucle de Simulated Annealing
-    (sin llamar al LLM), evitando duplicar la lógica de cohesión.
-    """
-    boundaries = [0] + sorted(cuts) + [n]
-    K = len(boundaries) - 1
-    return [segment_cohesion(embeddings, boundaries[i], boundaries[i + 1]) for i in range(K)]
-
-# ---------------------------------------------------------------------------
-# Scoring de embeddings normalizado a [0,1]
-# ---------------------------------------------------------------------------
-def score_partition_embeddings(
-    embeddings: np.ndarray,
-    cuts: list[int],
-    n: int,
-    min_seg: int = 3,
-) -> float:
-    """
-    Evalúa una partición basada únicamente en embeddings.
-    Combina cohesión media, separación entre segmentos (1 - similitud de
-    centroides adyacentes) y penalización por segmentos cortos.
-    El resultado se normaliza dividiendo por un factor teórico máximo (1.5)
-    para llevarlo al rango [0,1].
-    """
-    boundaries = [0] + sorted(cuts) + [n]
-    K = len(boundaries) - 1
-    cohs = compute_segment_cohesions(embeddings, cuts, n)
-    centroids = [embeddings[boundaries[i]:boundaries[i + 1]].mean(axis=0) for i in range(K)]
-    mean_coh = np.mean(cohs)
-    # Separación: 1 - similitud coseno entre centroides adyacentes
-    seps = []
-    for i in range(K - 1):
-        sim = cosine_similarity(centroids[i], centroids[i + 1])
-        seps.append(1.0 - sim)
-    mean_sep = np.mean(seps) if seps else 0.0
-    # Penalización por segmentos muy cortos
-    penalty = 0.0
-    for i in range(K):
-        size = boundaries[i + 1] - boundaries[i]
-        if size < min_seg:
-            penalty += (min_seg - size) * 0.2
-    raw = mean_coh + 0.5 * mean_sep - penalty
-    # Normalización: el máximo teórico (sin penalización) es 1.0 + 0.5*1.0 = 1.5
-    normalized = raw / 1.5
-    # Asegurar que quede en [0,1]
-    return max(0.0, min(1.0, normalized))
 
 # ---------------------------------------------------------------------------
 # F1 con tolerancia
@@ -123,23 +68,27 @@ def compute_f1(
     return f1, precision, recall
 
 # ---------------------------------------------------------------------------
-# CLI (delega en pipeline.py)
+# CLI
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Segmentación óptima con LLM local")
+    parser = argparse.ArgumentParser(description="Segmentación óptima de contenido (Pipeline Avanzado)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--dataset", type=Path, help="Ruta a dataset.json")
     group.add_argument("--text-file", type=Path, help="Ruta a un .txt")
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--model", type=str, default=MODEL_B)
-    parser.add_argument("--min-seg", type=int, default=3)
-    parser.add_argument("--max-k", type=int, default=8)
-    parser.add_argument("--llm-weight", type=float, default=0.4)
-    parser.add_argument("--max-iter-cap", type=int, default=2000)
-    parser.add_argument("--output", type=Path)
+    parser.add_argument("--min-seg", type=int, default=3, help="Tamaño mínimo de segmento")
+    parser.add_argument("--lambda-penalty", type=float, default=3.0,
+                        help="Penalización estructural por segmento (favorece menos cortes)")
+    parser.add_argument("--max-seg-len", type=int, default=None,
+                        help="Longitud máxima de un segmento candidato (por defecto: max(min_seg*4, n//2))")
+    parser.add_argument("--min-cohesion", type=float, default=0.5,
+                        help="Cohesión mínima de embeddings para evaluar una arista con el LLM")
+    parser.add_argument("--embedding-weight", type=float, default=0.3,
+                        help="Peso de la cohesión de embeddings al combinar con el costo del LLM (0-1)")
+    parser.add_argument("--output", type=Path, help="Guardar resultado en JSON")
     args = parser.parse_args()
 
-    # Importar aquí para no obligar en import del módulo
     from pipeline import run_pipeline
 
     if args.dataset:
@@ -159,13 +108,14 @@ def main():
         sentences,
         model_path=args.model,
         min_seg=args.min_seg,
-        max_k=args.max_k,
-        llm_weight=args.llm_weight,
-        max_iter_cap=args.max_iter_cap,
+        lambda_penalty=args.lambda_penalty,
+        max_seg_len=args.max_seg_len,
+        min_cohesion=args.min_cohesion,
+        embedding_weight=args.embedding_weight,
     )
 
     print("=" * 62)
-    print("SEGMENTACION OPTIMA (pipeline integrado)")
+    print("SEGMENTACION OPTIMA (Pipeline Avanzado)")
     print("=" * 62)
     print(f"Instancia        : {title}")
     print(f"Oraciones        : {result['n_sentences']}")
@@ -174,7 +124,17 @@ def main():
     print(f"Cohesion media   : {result['cohesion_mean']:.4f}")
     print(f"Cohesion x seg.  : {[f'{c:.3f}' for c in result['seg_cohesions']]}")
     print(f"Llamadas LLM     : {result['total_llm_calls']}")
-    print(f"Score combinado  : {result['combined_score']:.4f}")
+
+    dp_stats = result.get("dp_stats", {})
+    cache_stats = result.get("cache_stats", {})
+    if dp_stats:
+        print(f"\nAristas totales      : {dp_stats['edges_total']}")
+        print(f"  podadas (longitud) : {dp_stats['edges_pruned_length']}")
+        print(f"  podadas (cohesión) : {dp_stats['edges_pruned_cohesion']}")
+        print(f"  evaluadas con LLM  : {dp_stats['edges_evaluated_llm']}")
+    if cache_stats:
+        print(f"  respuestas truncadas (<think> sin cerrar): "
+              f"{cache_stats.get('truncated', 0)} / {dp_stats.get('edges_evaluated_llm', 0)}")
 
     if gt_cuts:
         f1, p, r = compute_f1(result["best_cuts"], gt_cuts, tolerance=1)
@@ -201,6 +161,7 @@ def main():
             "cohesion_mean": result["cohesion_mean"],
             "llm_calls": result["total_llm_calls"],
             "n_sentences": result["n_sentences"],
+            "dp_stats": dp_stats,
         }
         if gt_cuts:
             f1, p, r = compute_f1(result["best_cuts"], gt_cuts, tolerance=1)

@@ -45,8 +45,11 @@ adaptive_segmentation.py
 dataset_generator.py
 dataset_synthetic.py
 download_models.py
+dp_segmentation.py
 embeddings.py
 llm_evaluator.py
+llm.py
+Modelo.md
 Orientación.md
 pipeline.py
 requirements.txt
@@ -60,38 +63,265 @@ tune_expansion.py
 <files>
 This section contains the contents of the repository's files.
 
-<file path="download_models.py">
+<file path="dp_segmentation.py">
 """
-download_models.py
+dp_segmentation.py
 ------------------
-Descarga los modelos de embeddings y los guarda en ./models/.
-Modelo A: paraphrase-multilingual-MiniLM-L12-v2
-Modelo B: paraphrase-multilingual-mpnet-base-v2
-
-Requisitos:
-    pip install sentence-transformers
+Segmentación Multiescala Adaptativa con Validación de Cortes por LLM.
 """
 
-from pathlib import Path
-from sentence_transformers import SentenceTransformer
+from __future__ import annotations
+import numpy as np
+from embeddings import cosine_similarity
+from llm_evaluator import evaluate_segment
 
-MODELS_DIR = Path("./models")
-MODEL_NAMES = [
-    "paraphrase-multilingual-MiniLM-L12-v2",
-    "paraphrase-multilingual-mpnet-base-v2",
-]
+def validate_cut(sentences: list[str], cut_idx: int) -> bool:
+    """Valida si un corte propuesto por embeddings realmente separa subtemas."""
+    # Creamos una ventana de contexto de 10 oraciones centradas en el corte
+    start = max(0, cut_idx - 5)
+    end = min(len(sentences), cut_idx + 5)
+    
+    # CORRECCIÓN: Pasamos la lista original y los índices absolutos.
+    # Esto mantiene la coherencia de la caché y arregla el log de consola.
+    score = evaluate_segment(sentences, start, end)
+    
+    # Si el LLM puntúa bajo, el corte marca un salto semántico relevante
+    return score < 5.0 
 
-def main():
-    MODELS_DIR.mkdir(exist_ok=True)
-    for name in MODEL_NAMES:
-        print(f"Descargando {name} ...")
-        model = SentenceTransformer(name)
-        save_path = MODELS_DIR / name
-        model.save(str(save_path))
-        print(f"  Guardado en {save_path}")
+def get_subtheme_cuts(sentences: list[str], embeddings: np.ndarray, start: int, end: int, min_seg: int) -> list[int]:
+    """Identifica y valida valles mediante embeddings + LLM con un umbral dinámico."""
+    # 1. Extraer las similitudes solo de este bloque específico
+    sims = [cosine_similarity(embeddings[i-1], embeddings[i]) for i in range(start + 1, end)]
+    
+    if not sims:
+        return []
+
+    # 2. Calcular un umbral dinámico (Media menos desviación estándar)
+    # Esto adapta la detección de cortes independientemente de qué tan cohesivo sea el texto base
+    threshold = np.mean(sims) - np.std(sims)
+
+    raw_candidates = []
+    for i in range(start + min_seg, end - min_seg + 1):
+        sim = cosine_similarity(embeddings[i-1], embeddings[i])
+        if sim < threshold: 
+            raw_candidates.append(i)
+    
+    # 3. Filtrado por distancia mínima y validación
+    filtered_cuts = []
+    last_cut = -min_seg
+    for cut in raw_candidates:
+        if cut - last_cut >= min_seg: # Distancia ajustada al tamaño mínimo
+            if validate_cut(sentences, cut):
+                filtered_cuts.append(cut)
+                last_cut = cut
+                
+    return filtered_cuts
+
+def hybrid_segmentation(
+    sentences: list[str], 
+    embeddings: np.ndarray, 
+    start: int, 
+    end: int, 
+    min_seg: int, 
+    score_threshold: float, 
+    stats: dict
+) -> list[int]:
+    """Segmentación recursiva para bloques detectados como mezclados."""
+    stats["edges_evaluated_llm"] += 1
+    score = evaluate_segment(sentences, start, end)
+    
+    if score >= score_threshold or (end - start) < (min_seg * 2):
+        return []
+
+    best_cut = -1
+    min_sim = float('inf')
+    for i in range(start + min_seg, end - min_seg + 1):
+        sim = cosine_similarity(embeddings[i-1], embeddings[i])
+        if sim < min_sim:
+            min_sim = sim
+            best_cut = i
+            
+    if best_cut == -1: return []
+
+    cuts_left = hybrid_segmentation(sentences, embeddings, start, best_cut, min_seg, score_threshold, stats)
+    cuts_right = hybrid_segmentation(sentences, embeddings, best_cut, end, min_seg, score_threshold, stats)
+
+    return sorted(list(set(cuts_left + [best_cut] + cuts_right)))
+
+def run_dp_segmentation(
+    sentences: list[str],
+    embeddings: np.ndarray,
+    min_seg: int = 3,
+    **kwargs
+) -> tuple[list[int], dict]:
+    """Función principal orquestadora."""
+    n = len(sentences)
+    score_threshold = kwargs.get("score_threshold", 9.0)
+    
+    stats = {
+        "edges_evaluated_llm": 0,
+        "edges_total": 0,
+        "edges_pruned_length": 0,
+        "edges_pruned_cohesion": 0
+    }
+
+    # Evaluación inicial estricta
+    score = evaluate_segment(sentences, 0, n)
+    stats["edges_evaluated_llm"] += 1
+
+    if score >= score_threshold:
+        print(f"  [Multiescala] Bloque cohesivo ({n} oraciones). Aplicando refinamiento fino...")
+        final_cuts = get_subtheme_cuts(sentences, embeddings, 0, n, min_seg)
+    else:
+        print(f"  [Multiescala] Bloque mezclado. Aplicando segmentación recursiva...")
+        final_cuts = hybrid_segmentation(sentences, embeddings, 0, n, min_seg, score_threshold, stats)
+
+    stats["edges_total"] = stats["edges_evaluated_llm"]
+    
+    return sorted(list(set(final_cuts))), stats
+</file>
+
+<file path="llm.py">
+import time
+import re
+from llm_evaluator import _call_llm
+
+TEXT_HIGHLY_COHESIVE = (
+    "Los cloroplastos se distinguen por ser unas estructuras polimorfas de color verde, siendo la "
+    "coloración que presentan consecuencia directa de la presencia del pigmento clorofila en su interior. "
+    "Los cloroplastos están delimitados por una envoltura formada, en la mayoría de las algas y en todas las plantas, "
+    "por dos membranas (externa e interna) llamadas envueltas, que son ricas en galactolípidos y sulfolípidos. "
+    "En algunas algas, las envueltas están formadas por tres o cuatro membranas, lo que se considera prueba de "
+    "que se han originado por procesos de endosimbiosis secundaria o terciaria. "
+    "Las envueltas de los cloroplastos regulan el tráfico de sustancias entre el citosol y el interior de estos orgánulos."
+)
+
+TEXT_SUBTLE_BOUNDARY = (
+    "A Sachs se debe la formulación de la ecuación básica de la fotosíntesis: 6 CO2 + 6 H2O → C6H12O6 + 6 O2. "
+    "Andreas Franz Wilhelm Schimper daría el nombre de cloroplastos a los cuerpos coloreados de Sachs. "
+    "En el último tercio del siglo XIX se sucederían los esfuerzos por establecer las propiedades físico-químicas "
+    "de las clorofilas y se comienzan a estudiar los aspectos ecofisiológicos de la fotosíntesis. "
+    "En 1905, Frederick Frost Blackman midió la velocidad a la que se produce la fotosíntesis en diferentes condiciones."
+)
+
+PROMPTS = {
+    "1_ANALISIS_TITULOS": """You are an editor for Wikipedia. Your job is to decide if a text block belongs under ONE single specific subheading, or if it needs to be split.
+
+Step 1: Write a highly specific subheading (max 4 words) for the FIRST half of the text.
+Step 2: Write a highly specific subheading (max 4 words) for the SECOND half of the text.
+Step 3: Compare them. Are they addressing the exact same specific concept, or has the focus shifted (e.g., from one historical era to another, or from a general theory to a specific experiment)?
+Step 4: Score the text from 1.0 to 10.0.
+- Score 9.0-10.0 ONLY if the exact same specific subheading applies perfectly to all sentences.
+- Score 1.0-4.0 if the subheadings would naturally be different.
+
+Text:
+{text}
+
+Write your analysis inside <think></think> tags. Output the final score EXACTLY like this: [SCORE: X.X]""",
+
+    "2_DETECTOR_PIVOTE": """Analyze the text strictly to find a "Pivot". 
+A Pivot is a point where the text changes its specific focus. Examples of Pivots:
+- Moving from a general timeline to a specific scientist's experiment.
+- Moving from macroscopic biology to molecular chemistry.
+- Moving from the 19th century to the 20th century.
+
+Rules:
+- If there is ZERO Pivot and the text is a static description of a single concept, score it 10.0.
+- If you detect EVEN A MINOR Pivot that shifts the focus, you must score it 3.0 or lower. Do not be generous.
+
+Text:
+{text}
+
+Explain your reasoning in 2 sentences inside <think></think> tags. Conclude with: [SCORE: X.X]""",
+
+    "3_EDITOR_IMPLACABLE": """You are a ruthless text segmentation algorithm. Your only job is to find reasons to cut paragraphs.
+
+Evaluate the text's homogeneity.
+- If the text is 100% homogeneous (e.g., all sentences describe the exact same physical structure, OR all sentences describe the exact same step in a process), score it 10.0.
+- If the text transitions between sub-topics (e.g., from author A to author B, from historical context to physical measurement, or from one century to another), you MUST cut it. Score it 2.0.
+
+Text:
+{text}
+
+Put your reasoning inside <think></think> tags. Output your final decision exactly as: [SCORE: X.X]"""
+}
+
+def test_parser(response: str) -> float:
+    match = re.search(r'\[SCORE:\s*([0-9]*\.?[0-9]+)\]', response, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    clean = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+    numbers = re.findall(r'\b(10(?:\.0)?|[1-9](?:\.\d)?)\b', clean)
+    if numbers:
+        return float(numbers[-1])
+    return 5.0
+
+def run_experiment():
+    print("="*80)
+    print(" ROUND 2: BUSCANDO UN CONTRASTE AGRESIVO EN CEREBRAS")
+    print("="*80)
+    
+    scenarios = [
+        ("COHESIVO PURO (Esperado: ~ 10.0)", TEXT_HIGHLY_COHESIVE),
+        ("TRANSICIÓN CRÍTICA (Esperado: < 4.0)", TEXT_SUBTLE_BOUNDARY)
+    ]
+    
+    for prompt_name, prompt_tmpl in PROMPTS.items():
+        print(f"\n🔥 PROBANDO: {prompt_name}")
+        print("-" * 60)
+        
+        for case_name, text_content in scenarios:
+            formatted_prompt = prompt_tmpl.format(text=text_content)
+            
+            print(f"-> Escenario: {case_name}")
+            try:
+                response = _call_llm(formatted_prompt)
+                score = test_parser(response)
+                
+                print(f"   [Resultado] Score: {score}/10")
+                
+                if "<think>" in response and "</think>" in response:
+                    reasoning = response.split("<think>")[1].split("</think>")[0].strip()
+                    print(f"   [Pensamiento]: {reasoning[:200]}...")
+                else:
+                    print(f"   [Respuesta]: {response.strip()[:150]}...")
+                    
+            except Exception as e:
+                print(f"   [!] Error: {e}")
+            
+            time.sleep(3)
+        print("-" * 60)
 
 if __name__ == "__main__":
-    main()
+    run_experiment()
+</file>
+
+<file path="Modelo.md">
+1. El Modelo Matemático (El Núcleo del Sistema)
+Vamos a modelar el texto como un Grafo Acíclico Dirigido (DAG) .
+Si tenemos un texto con N oraciones, creamos N+1 nodos, donde cada nodo representa un "punto de corte" potencial entre oraciones (el nodo 0 es el inicio del texto, el nodo N es el final).
+Una arista dirigida desde el nodo i hasta el nodo j (donde i<j) representa un segmento de texto que va desde la oración i hasta la oración j. Nuestro objetivo es encontrar el camino de menor coste desde 0 hasta N. Esta formulación de Programación Dinámica es matemáticamente idéntica a buscar la distancia de conexión óptima, por lo que puedes resolver la matriz usando el algoritmo de Dijkstra.
+La ecuación de transición de nuestra Programación Dinámica será:
+DP[j]=0≤i<j
+min
+(DP[i]+Costo(i,j)+λ)
+Donde:
+DP[j] es el coste mínimo para segmentar óptimamente las primeras j oraciones.
+Costo(i,j) es la "penalización por falta de coherencia" del segmento que va de i a j. Un segmento muy coherente tendrá un coste cercano a 0.
+λ es un hiperparámetro de penalización estructural. Evita que el algoritmo haga trampa creando un segmento por cada oración (lo cual tendría coherencia perfecta, pero sería inútil).
+2. El Rol del LLM (El Oráculo de Costes)
+El mayor peligro de la Programación Dinámica es la complejidad computacional. Si evaluamos todos los posibles segmentos (i,j) con el LLM, tendríamos O(N2
+) llamadas al modelo, lo cual paralizaría tu entorno local en Ubuntu.
+Para solucionarlo, usaremos una arquitectura de dos fases para la función Costo(i,j):
+Filtro Rápido (Embeddings): Usamos los modelos locales (como paraphrase-multilingual-mpnet-base-v2) para descartar aristas inválidas. Si la similitud coseno interna de un segmento (i,j) cae por debajo de un umbral, asumimos que el coste es infinito (∞) y podamos esa rama del grafo sin llamar al LLM. Además, limitamos la longitud máxima de un segmento a un número razonable de oraciones.
+Evaluación Precisa (LLM): Para los segmentos candidatos que sobreviven al filtro, le pasamos el texto al LLM con un prompt de clasificación estricto. Por ejemplo: "¿Este bloque de texto mantiene un único tema central sin desviaciones? Responde 1 (Sí) o 0 (No)". Transformamos esa respuesta binaria (o una escala muy acotada) en el valor numérico para Costo(i,j).
+3. Fases de Ejecución del Pipeline
+Para implementar esto de forma modular, dividiremos el código en bloques estrictos:
+Pre-procesamiento: Tokenización de oraciones y cálculo de la matriz de embeddings para todo el texto.
+Construcción del Grafo (Pruning): Generación de los nodos y aristas válidas utilizando heurísticas de tamaño (ej. mínimo 3 oraciones, máximo 20) y umbrales de embeddings para descartar la basura.
+Ponderación de Aristas: Iterar sobre las aristas válidas, consultando al LLM (y guardando en caché) para obtener el coste definitivo de cada segmento candidato.
+Búsqueda del Camino Óptimo: Ejecutar el algoritmo de Programación Dinámica (o Dijkstra) sobre el grafo ponderado para recuperar los índices exactos de los cortes.
+este es el contexto, no digas nada aun
 </file>
 
 <file path="Orientación.md">
@@ -143,621 +373,6 @@ Debe incluir:
 - Metodología experimental
 - Resultados y análisis
 - Limitaciones y posibles mejoras
-</file>
-
-<file path="pipeline.py">
-"""
-pipeline.py
------------
-Pipeline integrado de segmentación óptima.
-
-Flujo del LLM (importante para el informe — "Rol del LLM en el sistema"):
-  1. Para cada K candidato (2..max_k), se ejecuta Simulated Annealing
-     usando ÚNICAMENTE el score de embeddings (rápido, sin red).
-  2. Sobre la partición resultante de ese K, el LLM se llama UNA VEZ POR
-     SEGMENTO (K llamadas) para evaluar su cohesión semántica (1-10).
-  3. emb_score y llm_score (ambos normalizados a [0,1]) se combinan con
-     llm_weight para obtener el score combinado de ese K.
-  4. Se elige el K con mejor score combinado.
-
-  Total de llamadas al LLM ≈ sum(K) para K=2..max_possible_k — del orden
-  de decenas, no de miles.
-"""
-
-from __future__ import annotations
-
-from typing import Any, List
-
-import numpy as np
-
-from embeddings import (
-    compute_embeddings,
-    compute_similarity_profile,
-    find_local_valleys,
-    get_ranked_candidates,
-    get_initial_cuts,
-    MODEL_B,
-)
-from adaptive_segmentation import score_partition_embeddings, segment_cohesion
-from simulated_annealing import run_sa
-from llm_evaluator import evaluate_segment, reset_cache, get_cache_stats
-
-
-def run_pipeline(
-    sentences: List[str],
-    model_path: str = MODEL_B,
-    min_seg: int = 3,
-    max_k: int = 8,
-    llm_weight: float = 0.4,
-    max_iter_cap: int = 2000,
-    use_sa: bool = True,
-) -> dict[str, Any]:
-    n = len(sentences)
-    print(f"\n[Pipeline] Iniciando con {n} oraciones, max_k={max_k}, use_sa={use_sa}")
-
-    if n < 2:
-        print("[Pipeline] Texto demasiado corto, devolviendo segmento único")
-        return {
-            "best_cuts": [], "best_K": 1, "segments": [sentences],
-            "n_sentences": n, "cohesion_mean": 1.0, "seg_cohesions": [1.0],
-            "combined_score": 0.0, "llm_score": 0.0, "emb_score": 1.0,
-            "total_llm_calls": 0, "cache_stats": get_cache_stats(), "scores_por_K": {},
-        }
-
-    # 1. Embeddings
-    print(f"[Pipeline] Paso 1/4: Calculando embeddings...")
-    embeddings   = compute_embeddings(sentences, model_path)
-    similarities = compute_similarity_profile(embeddings)
-    print(f"[Pipeline] Embeddings calculados. Perfil de similitud: {len(similarities)} valores")
-
-    # 2. Valles
-    print(f"[Pipeline] Paso 2/4: Detectando valles locales...")
-    valleys = find_local_valleys(similarities)
-    print(f"[Pipeline] Valles encontrados: {len(valleys)}")
-
-    if not valleys:
-        print("[Pipeline] Sin valles detectados, devolviendo segmento único")
-        return {
-            "best_cuts": [], "best_K": 1, "segments": [sentences],
-            "n_sentences": n, "cohesion_mean": segment_cohesion(embeddings, 0, n),
-            "seg_cohesions": [segment_cohesion(embeddings, 0, n)],
-            "combined_score": 1.0, "llm_score": 0.0, "emb_score": 1.0,
-            "total_llm_calls": 0, "cache_stats": get_cache_stats(), "scores_por_K": {},
-        }
-
-    # 3. Probar cada K
-    max_possible_k = min(max_k, n // min_seg, len(valleys) + 1)
-    print(f"[Pipeline] Paso 3/4: Probando K de 2 a {max_possible_k}...")
-
-    best_combined = -np.inf
-    best_result   = None
-    scores_por_K  = {}
-
-    for K in range(2, max_possible_k + 1):
-        print(f"\n[Pipeline]   → K={K}:")
-
-        selected_valleys = valleys[:K - 1]
-        initial_cuts     = sorted([int(idx) + 1 for idx, _ in selected_valleys])
-        print(f"[Pipeline]     Cortes iniciales: {initial_cuts}")
-
-        if use_sa:
-            print(f"[Pipeline]     Ejecutando SA sobre embeddings "
-                  f"(rápido, sin LLM, max_iter_cap={max_iter_cap})...")
-            sa_result = run_sa(
-                sentences,
-                embeddings,
-                K=K,
-                initial_cuts=initial_cuts,
-                min_seg=min_seg,
-                max_iter_cap=max_iter_cap,
-                verbose=True,
-            )
-            cuts = sa_result["best_cuts"]
-            print(f"[Pipeline]     SA terminado. Cortes: {cuts} | "
-                  f"score_emb_SA={sa_result['best_score']:.3f} | "
-                  f"iter={sa_result['n_iter']} | mejoras={sa_result['n_improvements']}")
-        else:
-            cuts = initial_cuts
-            print(f"[Pipeline]     SA desactivado, usando cortes iniciales: {cuts}")
-
-        # Evaluación final con el LLM: una llamada por segmento de esta partición
-        print(f"[Pipeline]     Evaluando partición final con LLM ({K} llamadas)...")
-        reset_cache()
-        boundaries = [0] + cuts + [n]
-        seg_llm_scores = []
-        for i in range(K):
-            score = evaluate_segment(sentences, boundaries[i], boundaries[i + 1])
-            seg_llm_scores.append(score)
-        llm_score = (sum(seg_llm_scores) / K) / 10.0
-
-        cache_stats     = get_cache_stats()
-        total_llm_calls = cache_stats["misses"]
-
-        emb_score = score_partition_embeddings(embeddings, cuts, n, min_seg=min_seg)
-        combined  = (1 - llm_weight) * emb_score + llm_weight * llm_score
-
-        print(f"[Pipeline]     emb_score={emb_score:.3f} | llm_score={llm_score:.3f} | combined={combined:.3f}")
-
-        scores_por_K[K] = {
-            "cuts": cuts, "emb_score": emb_score,
-            "llm_score": llm_score, "combined": combined,
-            "llm_calls": total_llm_calls,
-        }
-
-        if combined > best_combined:
-            best_combined = combined
-            best_result   = {
-                "best_cuts": cuts, "best_K": K,
-                "combined_score": combined,
-                "emb_score": emb_score, "llm_score": llm_score,
-                "total_llm_calls": total_llm_calls,
-                "cache_stats": cache_stats,
-            }
-            print(f"[Pipeline]     ★ Nuevo mejor K={K} con combined={combined:.3f}")
-
-    if best_result is None:
-        print("[Pipeline] Ningún K válido encontrado, devolviendo segmento único")
-        return {
-            "best_cuts": [], "best_K": 1, "segments": [sentences],
-            "n_sentences": n, "cohesion_mean": segment_cohesion(embeddings, 0, n),
-            "seg_cohesions": [segment_cohesion(embeddings, 0, n)],
-            "combined_score": 1.0, "llm_score": 0.0, "emb_score": 1.0,
-            "total_llm_calls": 0, "cache_stats": get_cache_stats(), "scores_por_K": scores_por_K,
-        }
-
-    # 4. Construir resultado final
-    print(f"\n[Pipeline] Paso 4/4: Construyendo resultado final (K={best_result['best_K']})...")
-    boundaries    = [0] + best_result["best_cuts"] + [n]
-    K_best        = best_result["best_K"]
-    segments      = [sentences[boundaries[i]:boundaries[i + 1]] for i in range(K_best)]
-    cohs          = [segment_cohesion(embeddings, boundaries[i], boundaries[i + 1]) for i in range(K_best)]
-    cohesion_mean = float(np.mean(cohs)) if cohs else 0.0
-
-    best_result.update({
-        "segments": segments, "n_sentences": n,
-        "cohesion_mean": cohesion_mean, "seg_cohesions": cohs,
-        "scores_por_K": scores_por_K,
-    })
-
-    print(f"[Pipeline] ✓ Completado. K={K_best} | cohesion_media={cohesion_mean:.3f} | "
-          f"LLM_calls(K elegido)={best_result['total_llm_calls']}")
-    return best_result
-</file>
-
-<file path="run_experiments.py">
-"""
-run_experiments.py
-------------------
-Ejecuta el pipeline sobre todas las instancias de los datasets
-disponibles (dataset.json, dataset_synthetic.json), variando
-configuraciones:
-  - Modelo de embeddings (A / B)
-  - llm_weight (0.0, 0.4, 0.8)
-  - Con SA vs sin SA
-
-Genera results.csv y muestra tabla resumen.
-
-Nota sobre cache_hit_rate: con la arquitectura LLM-al-final, el cache se
-reinicia (reset_cache) antes de cada evaluación final por K, y cada
-segmento de esa partición se evalúa una sola vez. Por lo tanto
-cache_hit_rate será 0.0 en el caso normal (no hay reevaluaciones dentro
-de la misma partición); se mantiene en el CSV por completitud y para
-detectar particiones degeneradas con segmentos repetidos.
-
-Uso:
-    python run_experiments.py
-    python run_experiments.py --quick   # solo 3 instancias por dataset
-"""
-
-import csv
-import json
-import random
-import argparse
-import time
-from pathlib import Path
-
-from embeddings import MODEL_A, MODEL_B
-from pipeline import run_pipeline
-from adaptive_segmentation import compute_f1
-
-DATASETS        = ["dataset.json", "dataset_synthetic.json"]
-LLM_WEIGHTS     = [0.0, 0.4, 0.8]
-USE_SA_OPTIONS  = [True, False]
-MODEL_OPTIONS   = {"MODEL_A": MODEL_A, "MODEL_B": MODEL_B}
-MAX_ITER_CAP    = 2000  # el SA ya no llama al LLM, por lo que un cap alto
-                        # tiene costo despreciable (solo CPU)
-
-FIELDNAMES = [
-    "dataset", "instance_id", "title", "n_sentences", "K_real",
-    "model", "llm_weight", "use_sa",
-    "K_detected", "F1_tol0", "Precision_tol0", "Recall_tol0",
-    "F1_tol1", "Precision_tol1", "Recall_tol1",
-    "time_sec", "llm_calls", "cache_hit_rate",
-]
-
-
-def run_all(quick: bool = False) -> None:
-    random.seed(42)
-    results = []
-
-    print("=" * 70)
-    print("EJECUCIÓN DE EXPERIMENTOS")
-    print("=" * 70)
-
-    for ds_name in DATASETS:
-        ds_path = Path(ds_name)
-        if not ds_path.exists():
-            print(f"  [!] Dataset {ds_name} no encontrado, se omite.")
-            continue
-
-        with open(ds_path, encoding="utf-8") as f:
-            dataset = json.load(f)
-
-        if quick:
-            dataset = dataset[:3]
-
-        print(f"\nDataset: {ds_name} ({len(dataset)} instancias)")
-
-        for idx, instance in enumerate(dataset):
-            sentences = instance["sentences"]
-            gt_cuts   = instance.get("ground_truth_cuts", [])
-            title     = instance.get("title", f"instancia_{idx}")
-            n         = instance["n_sentences"]
-            K_real    = instance["K"]
-
-            for model_name, model_path in MODEL_OPTIONS.items():
-                if not Path(model_path).exists():
-                    print(f"  [!] Modelo {model_name} no encontrado, se omite.")
-                    continue
-
-                for lw in LLM_WEIGHTS:
-                    for use_sa in USE_SA_OPTIONS:
-                        tag = f"{model_name} | llm_w={lw} | SA={use_sa}"
-                        print(f"  [{idx+1}/{len(dataset)}] {title[:40]} | {tag} ...", end=" ", flush=True)
-
-                        t0 = time.time()
-                        try:
-                            res = run_pipeline(
-                                sentences,
-                                model_path   = model_path,
-                                min_seg      = 3,
-                                max_k        = 8,
-                                llm_weight   = lw,
-                                max_iter_cap = MAX_ITER_CAP,
-                                use_sa       = use_sa,
-                            )
-                        except Exception as e:
-                            print(f"ERROR: {e}")
-                            continue
-
-                        elapsed  = time.time() - t0
-                        f1_0, p0, r0 = compute_f1(res["best_cuts"], gt_cuts, tolerance=0)
-                        f1_1, p1, r1 = compute_f1(res["best_cuts"], gt_cuts, tolerance=1)
-                        calls    = res.get("total_llm_calls", 0)
-                        hit_rate = res.get("cache_stats", {}).get("hit_rate", 0.0)
-
-                        results.append({
-                            "dataset":         ds_name,
-                            "instance_id":     idx,
-                            "title":           title,
-                            "n_sentences":     n,
-                            "K_real":          K_real,
-                            "model":           model_name,
-                            "llm_weight":      lw,
-                            "use_sa":          use_sa,
-                            "K_detected":      res["best_K"],
-                            "F1_tol0":         f1_0,
-                            "Precision_tol0":  p0,
-                            "Recall_tol0":     r0,
-                            "F1_tol1":         f1_1,
-                            "Precision_tol1":  p1,
-                            "Recall_tol1":     r1,
-                            "time_sec":        elapsed,
-                            "llm_calls":       calls,
-                            "cache_hit_rate":  hit_rate,
-                        })
-                        print(f"K={res['best_K']} F1={f1_0:.3f} ({elapsed:.1f}s)")
-
-    # Exportar CSV
-    csv_path = "results.csv"
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"\nResultados guardados en: {csv_path}")
-
-    # Tabla resumen
-    if not results:
-        print("Sin resultados para mostrar.")
-        return
-
-    print("\n" + "=" * 90)
-    print("RESUMEN POR CONFIGURACIÓN (promedios)")
-    print("=" * 90)
-    print(f"{'Modelo':<10} {'llm_w':<6} {'SA':<6} {'N':<5} "
-          f"{'F1(tol0)':<9} {'F1(tol1)':<9} {'t(s)':<7} {'LLM':<8}")
-    print("-" * 90)
-
-    groups: dict = {}
-    for r in results:
-        key = (r["model"], r["llm_weight"], r["use_sa"])
-        groups.setdefault(key, []).append(r)
-
-    for (model, lw, sa), items in sorted(groups.items()):
-        avg_f1_0  = sum(it["F1_tol0"]   for it in items) / len(items)
-        avg_f1_1  = sum(it["F1_tol1"]   for it in items) / len(items)
-        avg_t     = sum(it["time_sec"]   for it in items) / len(items)
-        avg_calls = sum(it["llm_calls"]  for it in items) / len(items)
-        print(f"{model:<10} {lw:<6.1f} {str(sa):<6} {len(items):<5} "
-              f"{avg_f1_0:<9.3f} {avg_f1_1:<9.3f} {avg_t:<7.1f} {avg_calls:<8.0f}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true",
-                        help="Ejecutar solo 3 instancias por dataset (para pruebas)")
-    args = parser.parse_args()
-    run_all(quick=args.quick)
-</file>
-
-<file path="test_llm_calibration.py">
-"""
-test_llm_calibration.py
------------------------
-Verifica rápidamente si el LLM distingue entre segmentos cohesivos
-y segmentos mezclados ANTES de ejecutar run_experiments.py completo.
-
-Uso:
-    python test_llm_calibration.py
-
-Salida esperada:
-  - Segmento cohesivo: score ~7-10
-  - Segmento mezclado: score ~1-4
-  - Diferencia >= 3 → LLM calibrado, llm_weight puede usarse con confianza
-  - Diferencia < 3  → LLM poco discriminativo, reducir llm_weight o documentar
-"""
-
-from llm_evaluator import evaluate_segment, get_cache_stats, reset_cache
-
-# ---------------------------------------------------------------------------
-# Ejemplos manuales fijos
-# ---------------------------------------------------------------------------
-
-# (a) Segmento claramente cohesivo: todo sobre fotosíntesis
-COHESIVE = [
-    "La fotosíntesis es el proceso por el cual las plantas convierten luz solar en energía química.",
-    "Las plantas capturan la luz mediante la clorofila, un pigmento verde presente en los cloroplastos.",
-    "Durante la fotosíntesis se producen glucosa y oxígeno a partir de dióxido de carbono y agua.",
-    "La glucosa obtenida sirve como fuente de energía para el crecimiento y desarrollo de la planta.",
-    "Sin fotosíntesis, la cadena alimentaria y la producción de oxígeno en la Tierra serían imposibles.",
-]
-
-# (b) Segmento mezclado: fotosíntesis + Imperio romano + astronomía
-MIXED = [
-    "La fotosíntesis convierte la luz solar en energía química almacenada en glucosa.",
-    "El Imperio romano dominó gran parte de Europa, el norte de África y el Medio Oriente.",
-    "La Vía Láctea es una galaxia espiral barrada que contiene entre 200 y 400 mil millones de estrellas.",
-    "Las plantas usan la clorofila para absorber la energía lumínica necesaria para la fotosíntesis.",
-    "Roma fundó instituciones que influyeron profundamente en el derecho y la cultura occidentales.",
-]
-
-# (c) Segmento moderadamente cohesivo: historia de la ciencia (relacionado pero no idéntico)
-MODERATE = [
-    "Isaac Newton formuló las leyes del movimiento y la gravitación universal en el siglo XVII.",
-    "Albert Einstein desarrolló la teoría de la relatividad especial y general a principios del siglo XX.",
-    "Marie Curie fue pionera en el estudio de la radiactividad y primera mujer en ganar el Nobel.",
-    "Charles Darwin propuso la teoría de la evolución por selección natural en 1859.",
-    "Galileo Galilei fue uno de los primeros científicos en usar el telescopio para observar el cielo.",
-]
-
-
-def run_calibration():
-    reset_cache()
-    print("=" * 60)
-    print("TEST DE CALIBRACIÓN DEL LLM")
-    print("=" * 60)
-
-    print("\n[1/3] Segmento COHESIVO (fotosíntesis):")
-    score_coh = evaluate_segment(COHESIVE, 0, len(COHESIVE))
-    print(f"      Score: {score_coh:.1f}/10  (esperado: 7-10)")
-
-    print("\n[2/3] Segmento MEZCLADO (fotosíntesis + Roma + astronomía):")
-    score_mix = evaluate_segment(MIXED, 0, len(MIXED))
-    print(f"      Score: {score_mix:.1f}/10  (esperado: 1-4)")
-
-    print("\n[3/3] Segmento MODERADO (historia de la ciencia):")
-    score_mod = evaluate_segment(MODERATE, 0, len(MODERATE))
-    print(f"      Score: {score_mod:.1f}/10  (esperado: 5-7)")
-
-    print(f"\n{'─'*60}")
-    print("RESULTADO")
-    print(f"{'─'*60}")
-    print(f"  Cohesivo  : {score_coh:.1f}")
-    print(f"  Moderado  : {score_mod:.1f}")
-    print(f"  Mezclado  : {score_mix:.1f}")
-    diff = score_coh - score_mix
-    print(f"  Diferencia cohesivo - mezclado: {diff:.1f}")
-
-    print()
-    if diff >= 3:
-        print("✓ El LLM distingue bien entre cohesivo y mezclado.")
-        print("  llm_weight puede usarse con confianza en pipeline.py.")
-    elif diff >= 1:
-        print("⚠ El LLM distingue poco. Diferencia < 3.")
-        print("  Recomendación: reducir llm_weight a 0.2 o menos.")
-        print("  Documenta esta limitación en el informe.")
-    else:
-        print("✗ El LLM NO distingue entre cohesivo y mezclado.")
-        print("  Recomendación: usar llm_weight=0.0 (solo embeddings)")
-        print("  o probar con un modelo mayor.")
-        print("  Documenta esta limitación en el informe.")
-
-    stats = get_cache_stats()
-    print(f"\nLlamadas LLM: {stats['misses']} | Tiempo estimado: {stats['misses'] * 10}s aprox.")
-
-
-if __name__ == "__main__":
-    run_calibration()
-</file>
-
-<file path="test_prompts.py">
-"""
-test_prompts.py
----------------
-Prueba 3 estilos de prompt distintos para encontrar cuál hace que
-mi-llama:latest distinga entre texto cohesivo y texto mezclado.
-
-Uso:
-    python test_prompts.py
-"""
-
-import re
-import requests
-import time
-
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL      = "mi-llama:latest"
-
-# ---------------------------------------------------------------------------
-# Textos de prueba
-# ---------------------------------------------------------------------------
-
-COHESIVE_TEXT = (
-    "La fotosíntesis es el proceso por el cual las plantas convierten luz solar en energía química. "
-    "Las plantas capturan la luz mediante la clorofila, un pigmento verde presente en los cloroplastos. "
-    "Durante la fotosíntesis se producen glucosa y oxígeno a partir de dióxido de carbono y agua. "
-    "La glucosa sirve como fuente de energía para el crecimiento de la planta. "
-    "Sin fotosíntesis, la producción de oxígeno en la Tierra sería imposible."
-)
-
-MIXED_TEXT = (
-    "La fotosíntesis convierte la luz solar en energía química almacenada en glucosa. "
-    "El Imperio romano dominó gran parte de Europa, el norte de África y el Medio Oriente. "
-    "La Vía Láctea es una galaxia espiral barrada con entre 200 y 400 mil millones de estrellas. "
-    "Las plantas usan la clorofila para absorber la energía lumínica necesaria. "
-    "Roma fundó instituciones que influyeron profundamente en el derecho occidental."
-)
-
-# ---------------------------------------------------------------------------
-# Prompts a probar
-# ---------------------------------------------------------------------------
-
-PROMPTS = {
-    "A — Pregunta directa con escala": (
-        "En una escala del 1 al 10, ¿qué tan cohesionado temáticamente es este texto?\n"
-        "1 = trata varios temas sin relación. 10 = trata un único tema de principio a fin.\n"
-        "Responde SOLO con el número.\n\n"
-        "Texto: {texto}\n\n"
-        "Puntuación:"
-    ),
-    "B — Pregunta binaria primero, luego número": (
-        "Lee este texto y decide:\n"
-        "¿Todas las oraciones tratan el MISMO tema? (sí/no)\n"
-        "Luego da una puntuación de cohesión del 1 al 10.\n"
-        "Formato de respuesta: [sí/no] [número]\n\n"
-        "Texto: {texto}\n\n"
-        "Respuesta:"
-    ),
-    "C — Instrucción en inglés (modelos pequeños responden mejor)": (
-        "Rate the thematic coherence of this text from 1 to 10.\n"
-        "1 = completely unrelated topics mixed together.\n"
-        "10 = all sentences discuss exactly the same topic.\n"
-        "Reply with ONLY a single number.\n\n"
-        "Text: {texto}\n\n"
-        "Score:"
-    ),
-}
-
-
-def call_llm(prompt: str, num_predict: int = 10) -> str:
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.0,
-            "num_predict": num_predict,
-        }
-    }
-    t0 = time.time()
-    response = requests.post(OLLAMA_URL, json=payload, timeout=60)
-    response.raise_for_status()
-    elapsed = time.time() - t0
-    content = response.json().get("response", "").strip()
-    return content, elapsed
-
-
-def parse_score(response: str) -> float:
-    numbers = re.findall(r'\b(10|[1-9])\b', response)
-    if numbers:
-        return float(numbers[0])
-    digits = re.findall(r'\d', response)
-    if digits:
-        return float(min(10, max(1, int(digits[0]))))
-    return -1.0  # -1 indica que no se encontró número
-
-
-def run_tests():
-    print("=" * 65)
-    print(f"PRUEBA DE PROMPTS — modelo: {MODEL}")
-    print("=" * 65)
-
-    results = {}
-
-    for prompt_name, prompt_template in PROMPTS.items():
-        print(f"\n{'─'*65}")
-        print(f"Prompt {prompt_name}")
-        print(f"{'─'*65}")
-
-        for label, text in [("COHESIVO", COHESIVE_TEXT), ("MEZCLADO", MIXED_TEXT)]:
-            prompt = prompt_template.format(texto=text)
-            try:
-                response, elapsed = call_llm(prompt, num_predict=15)
-                score = parse_score(response)
-                status = f"{score:.0f}/10" if score >= 0 else "NO NÚMERO"
-                print(f"  {label:<10}: '{response[:40]}' → {status}  ({elapsed:.1f}s)")
-                results.setdefault(prompt_name, {})[label] = score
-            except Exception as e:
-                print(f"  {label:<10}: ERROR — {e}")
-                results.setdefault(prompt_name, {})[label] = -1
-
-    # Resumen
-    print(f"\n{'='*65}")
-    print("RESUMEN — ¿Qué prompt distingue mejor cohesivo vs mezclado?")
-    print(f"{'='*65}")
-    print(f"{'Prompt':<45} {'Cohesivo':>8} {'Mezclado':>8} {'Diff':>6}")
-    print(f"{'─'*45} {'─'*8} {'─'*8} {'─'*6}")
-
-    best_diff = -999
-    best_prompt = None
-
-    for pname, scores in results.items():
-        coh = scores.get("COHESIVO", -1)
-        mix = scores.get("MEZCLADO", -1)
-        diff = coh - mix if coh >= 0 and mix >= 0 else -999
-        label = "✓ MEJOR" if diff == max(
-            (s.get("COHESIVO", -1) - s.get("MEZCLADO", -1))
-            for s in results.values()
-        ) else ""
-        print(f"  {pname[:43]:<43} {coh:>8.1f} {mix:>8.1f} {diff:>+6.1f}  {label}")
-        if diff > best_diff:
-            best_diff = diff
-            best_prompt = pname
-
-    print()
-    if best_diff >= 3:
-        print(f"✓ Prompt '{best_prompt}' funciona bien (diff={best_diff:.1f}).")
-        print("  Actualiza EVAL_PROMPT en llm_evaluator.py con ese prompt.")
-    elif best_diff >= 1:
-        print(f"⚠ Prompt '{best_prompt}' distingue poco (diff={best_diff:.1f}).")
-        print("  Considera bajar llm_weight a 0.1-0.2.")
-    else:
-        print("✗ Ningún prompt funciona bien con este modelo.")
-        print("  Recomendación: usar llm_weight=0.0 o cambiar de modelo.")
-
-
-if __name__ == "__main__":
-    run_tests()
 </file>
 
 <file path="dataset_generator.py">
@@ -1253,6 +868,615 @@ if __name__ == "__main__":
         print(f"  Temas   : {[s['group'] for s in ex['segments_info']]}")
 </file>
 
+<file path="download_models.py">
+"""
+download_models.py
+------------------
+Descarga los modelos de embeddings y los guarda en ./models/.
+Modelo A: paraphrase-multilingual-MiniLM-L12-v2
+Modelo B: paraphrase-multilingual-mpnet-base-v2
+
+Requisitos:
+    pip install sentence-transformers
+"""
+
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+
+MODELS_DIR = Path("./models")
+MODEL_NAMES = [
+    "paraphrase-multilingual-MiniLM-L12-v2",
+    "paraphrase-multilingual-mpnet-base-v2",
+]
+
+def main():
+    MODELS_DIR.mkdir(exist_ok=True)
+    for name in MODEL_NAMES:
+        print(f"Descargando {name} ...")
+        model = SentenceTransformer(name)
+        save_path = MODELS_DIR / name
+        model.save(str(save_path))
+        print(f"  Guardado en {save_path}")
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="pipeline.py">
+"""
+pipeline.py
+-----------
+Pipeline de segmentación basado en DP con Grafo Esparcido y poda por
+embeddings (ver dp_segmentation.py para el detalle del costo de cada
+arista y las podas aplicadas).
+"""
+
+from typing import Any, List
+import numpy as np
+
+from embeddings import compute_embeddings, MODEL_B
+from dp_segmentation import run_dp_segmentation
+from llm_evaluator import reset_cache, get_cache_stats
+from adaptive_segmentation import segment_cohesion
+
+
+def run_pipeline(
+    sentences: List[str],
+    model_path: str = MODEL_B,
+    min_seg: int = 3,
+    lambda_penalty: float = 3.0,
+    max_seg_len: int | None = None,
+    min_cohesion: float = 0.5,
+    embedding_weight: float = 0.3,
+    **kwargs,
+) -> dict[str, Any]:
+    n = len(sentences)
+    print(f"\n[Pipeline] Preparando modelo matemático...")
+
+    if n < 2:
+        return {
+            "best_cuts": [], "best_K": 1, "segments": [sentences],
+            "n_sentences": n, "cohesion_mean": 1.0, "seg_cohesions": [1.0],
+            "total_llm_calls": 0, "cache_stats": get_cache_stats(),
+            "dp_stats": {},
+        }
+
+    # 1. Representaciones base
+    embeddings = compute_embeddings(sentences, model_path)
+    reset_cache()
+
+    # 2. Ejecutar motor de Programación Dinámica con poda por embeddings
+    cuts, dp_stats = run_dp_segmentation(
+        sentences=sentences,
+        embeddings=embeddings,
+        min_seg=min_seg,
+        lambda_penalty=lambda_penalty,
+        max_seg_len=max_seg_len,
+        min_cohesion=min_cohesion,
+        embedding_weight=embedding_weight,
+    )
+
+    # 3. Formatear salida
+    K = len(cuts) + 1
+    boundaries = [0] + cuts + [n]
+    segments = [sentences[boundaries[i]:boundaries[i + 1]] for i in range(K)]
+
+    cohs = [segment_cohesion(embeddings, boundaries[i], boundaries[i + 1]) for i in range(K)]
+    cohesion_mean = float(np.mean(cohs)) if cohs else 0.0
+
+    cache_stats     = get_cache_stats()
+    total_llm_calls = cache_stats["misses"]
+
+    print(f"\n[Pipeline] ¡Camino óptimo encontrado! Cortes finales: {cuts}")
+
+    return {
+        "best_cuts": cuts,
+        "best_K": K,
+        "segments": segments,
+        "n_sentences": n,
+        "cohesion_mean": cohesion_mean,
+        "seg_cohesions": cohs,
+        "total_llm_calls": total_llm_calls,
+        "cache_stats": cache_stats,
+        "dp_stats": dp_stats,
+    }
+</file>
+
+<file path="run_experiments.py">
+"""
+run_experiments.py
+------------------
+Ejecuta el pipeline (DP + grafo esparcido con poda por embeddings) sobre
+todas las instancias de los datasets disponibles (dataset.json,
+dataset_synthetic.json), variando:
+  - Modelo de embeddings (A / B)
+  - lambda_penalty (penalización estructural por segmento)
+  - embedding_weight (peso de la cohesión de embeddings frente al LLM)
+
+Genera results.csv y muestra tabla resumen.
+
+Nota: cada combinación de hiperparámetros implica una corrida completa
+del DP, con sus propias llamadas al LLM (del orden de 15-30 por
+instancia, según las podas). Si el dataset es grande, usa --quick para
+limitar a 3 instancias por dataset durante pruebas.
+
+Uso:
+    python run_experiments.py
+    python run_experiments.py --quick   # solo 3 instancias por dataset
+"""
+
+import csv
+import json
+import random
+import argparse
+import time
+from pathlib import Path
+
+from embeddings import MODEL_A, MODEL_B
+from pipeline import run_pipeline
+from adaptive_segmentation import compute_f1
+
+DATASETS          = ["dataset.json", "dataset_synthetic.json"]
+LAMBDA_PENALTIES  = [1.0, 3.0, 5.0]
+EMBEDDING_WEIGHT  = 0.3   # fijo; documentar en el informe si se quiere
+                          # barrer también este parámetro
+MIN_COHESION      = 0.5
+MODEL_OPTIONS     = {"MODEL_A": MODEL_A, "MODEL_B": MODEL_B}
+
+FIELDNAMES = [
+    "dataset", "instance_id", "title", "n_sentences", "K_real",
+    "model", "lambda_penalty", "embedding_weight",
+    "K_detected", "F1_tol0", "Precision_tol0", "Recall_tol0",
+    "F1_tol1", "Precision_tol1", "Recall_tol1",
+    "time_sec", "llm_calls", "cache_hit_rate",
+    "edges_total", "edges_pruned_length", "edges_pruned_cohesion", "edges_evaluated_llm",
+]
+
+
+def run_all(quick: bool = False) -> None:
+    random.seed(42)
+    results = []
+
+    print("=" * 70)
+    print("EJECUCIÓN DE EXPERIMENTOS")
+    print("=" * 70)
+
+    for ds_name in DATASETS:
+        ds_path = Path(ds_name)
+        if not ds_path.exists():
+            print(f"  [!] Dataset {ds_name} no encontrado, se omite.")
+            continue
+
+        with open(ds_path, encoding="utf-8") as f:
+            dataset = json.load(f)
+
+        if quick:
+            dataset = dataset[:3]
+
+        print(f"\nDataset: {ds_name} ({len(dataset)} instancias)")
+
+        for idx, instance in enumerate(dataset):
+            sentences = instance["sentences"]
+            gt_cuts   = instance.get("ground_truth_cuts", [])
+            title     = instance.get("title", f"instancia_{idx}")
+            n         = instance["n_sentences"]
+            K_real    = instance["K"]
+
+            for model_name, model_path in MODEL_OPTIONS.items():
+                if not Path(model_path).exists():
+                    print(f"  [!] Modelo {model_name} no encontrado, se omite.")
+                    continue
+
+                for lp in LAMBDA_PENALTIES:
+                    tag = f"{model_name} | lambda={lp}"
+                    print(f"  [{idx+1}/{len(dataset)}] {title[:40]} | {tag} ...", end=" ", flush=True)
+
+                    t0 = time.time()
+                    try:
+                        res = run_pipeline(
+                            sentences,
+                            model_path       = model_path,
+                            min_seg          = 3,
+                            lambda_penalty   = lp,
+                            min_cohesion     = MIN_COHESION,
+                            embedding_weight = EMBEDDING_WEIGHT,
+                        )
+                    except Exception as e:
+                        print(f"ERROR: {e}")
+                        continue
+
+                    elapsed  = time.time() - t0
+                    f1_0, p0, r0 = compute_f1(res["best_cuts"], gt_cuts, tolerance=0)
+                    f1_1, p1, r1 = compute_f1(res["best_cuts"], gt_cuts, tolerance=1)
+                    calls    = res.get("total_llm_calls", 0)
+                    hit_rate = res.get("cache_stats", {}).get("hit_rate", 0.0)
+                    dp_stats = res.get("dp_stats", {})
+
+                    results.append({
+                        "dataset":               ds_name,
+                        "instance_id":           idx,
+                        "title":                 title,
+                        "n_sentences":           n,
+                        "K_real":                K_real,
+                        "model":                 model_name,
+                        "lambda_penalty":        lp,
+                        "embedding_weight":      EMBEDDING_WEIGHT,
+                        "K_detected":            res["best_K"],
+                        "F1_tol0":               f1_0,
+                        "Precision_tol0":        p0,
+                        "Recall_tol0":           r0,
+                        "F1_tol1":               f1_1,
+                        "Precision_tol1":        p1,
+                        "Recall_tol1":           r1,
+                        "time_sec":              elapsed,
+                        "llm_calls":             calls,
+                        "cache_hit_rate":        hit_rate,
+                        "edges_total":           dp_stats.get("edges_total", 0),
+                        "edges_pruned_length":   dp_stats.get("edges_pruned_length", 0),
+                        "edges_pruned_cohesion": dp_stats.get("edges_pruned_cohesion", 0),
+                        "edges_evaluated_llm":   dp_stats.get("edges_evaluated_llm", 0),
+                    })
+                    print(f"K={res['best_K']} F1={f1_0:.3f} ({elapsed:.1f}s)")
+
+    # Exportar CSV
+    csv_path = "results.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"\nResultados guardados en: {csv_path}")
+
+    # Tabla resumen
+    if not results:
+        print("Sin resultados para mostrar.")
+        return
+
+    print("\n" + "=" * 90)
+    print("RESUMEN POR CONFIGURACIÓN (promedios)")
+    print("=" * 90)
+    print(f"{'Modelo':<10} {'lambda':<8} {'N':<5} "
+          f"{'F1(tol0)':<9} {'F1(tol1)':<9} {'t(s)':<7} {'LLM':<6} {'PodCoh':<7}")
+    print("-" * 90)
+
+    groups: dict = {}
+    for r in results:
+        key = (r["model"], r["lambda_penalty"])
+        groups.setdefault(key, []).append(r)
+
+    for (model, lp), items in sorted(groups.items()):
+        avg_f1_0  = sum(it["F1_tol0"]   for it in items) / len(items)
+        avg_f1_1  = sum(it["F1_tol1"]   for it in items) / len(items)
+        avg_t     = sum(it["time_sec"]  for it in items) / len(items)
+        avg_calls = sum(it["llm_calls"] for it in items) / len(items)
+        avg_pruned_coh = sum(it["edges_pruned_cohesion"] for it in items) / len(items)
+        print(f"{model:<10} {lp:<8.1f} {len(items):<5} "
+              f"{avg_f1_0:<9.3f} {avg_f1_1:<9.3f} {avg_t:<7.1f} {avg_calls:<6.0f} {avg_pruned_coh:<7.1f}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--quick", action="store_true",
+                        help="Ejecutar solo 3 instancias por dataset (para pruebas)")
+    args = parser.parse_args()
+    run_all(quick=args.quick)
+</file>
+
+<file path="test_llm_calibration.py">
+"""
+test_llm_calibration.py
+-----------------------
+Verifica rápidamente si el LLM distingue entre segmentos cohesivos
+y segmentos mezclados ANTES de ejecutar run_experiments.py completo.
+
+Uso:
+    python test_llm_calibration.py
+
+Salida esperada:
+  - Segmento cohesivo: score ~7-10
+  - Segmento mezclado: score ~1-4
+  - Diferencia >= 3 → LLM calibrado, llm_weight puede usarse con confianza
+  - Diferencia < 3  → LLM poco discriminativo, reducir llm_weight o documentar
+"""
+
+from llm_evaluator import evaluate_segment, get_cache_stats, reset_cache
+
+# ---------------------------------------------------------------------------
+# Ejemplos manuales fijos
+# ---------------------------------------------------------------------------
+
+# (a) Segmento claramente cohesivo: todo sobre fotosíntesis
+COHESIVE = [
+    "La fotosíntesis es el proceso por el cual las plantas convierten luz solar en energía química.",
+    "Las plantas capturan la luz mediante la clorofila, un pigmento verde presente en los cloroplastos.",
+    "Durante la fotosíntesis se producen glucosa y oxígeno a partir de dióxido de carbono y agua.",
+    "La glucosa obtenida sirve como fuente de energía para el crecimiento y desarrollo de la planta.",
+    "Sin fotosíntesis, la cadena alimentaria y la producción de oxígeno en la Tierra serían imposibles.",
+]
+
+# (b) Segmento mezclado: fotosíntesis + Imperio romano + astronomía
+MIXED = [
+    "La fotosíntesis convierte la luz solar en energía química almacenada en glucosa.",
+    "El Imperio romano dominó gran parte de Europa, el norte de África y el Medio Oriente.",
+    "La Vía Láctea es una galaxia espiral barrada que contiene entre 200 y 400 mil millones de estrellas.",
+    "Las plantas usan la clorofila para absorber la energía lumínica necesaria para la fotosíntesis.",
+    "Roma fundó instituciones que influyeron profundamente en el derecho y la cultura occidentales.",
+]
+
+# (c) Segmento moderadamente cohesivo: historia de la ciencia (relacionado pero no idéntico)
+MODERATE = [
+    "Isaac Newton formuló las leyes del movimiento y la gravitación universal en el siglo XVII.",
+    "Albert Einstein desarrolló la teoría de la relatividad especial y general a principios del siglo XX.",
+    "Marie Curie fue pionera en el estudio de la radiactividad y primera mujer en ganar el Nobel.",
+    "Charles Darwin propuso la teoría de la evolución por selección natural en 1859.",
+    "Galileo Galilei fue uno de los primeros científicos en usar el telescopio para observar el cielo.",
+]
+
+
+def run_calibration():
+    reset_cache()
+    print("=" * 60)
+    print("TEST DE CALIBRACIÓN DEL LLM")
+    print("=" * 60)
+
+    print("\n[1/3] Segmento COHESIVO (fotosíntesis):")
+    score_coh = evaluate_segment(COHESIVE, 0, len(COHESIVE))
+    print(f"      Score: {score_coh:.1f}/10  (esperado: 7-10)")
+
+    print("\n[2/3] Segmento MEZCLADO (fotosíntesis + Roma + astronomía):")
+    score_mix = evaluate_segment(MIXED, 0, len(MIXED))
+    print(f"      Score: {score_mix:.1f}/10  (esperado: 1-4)")
+
+    print("\n[3/3] Segmento MODERADO (historia de la ciencia):")
+    score_mod = evaluate_segment(MODERATE, 0, len(MODERATE))
+    print(f"      Score: {score_mod:.1f}/10  (esperado: 5-7)")
+
+    print(f"\n{'─'*60}")
+    print("RESULTADO")
+    print(f"{'─'*60}")
+    print(f"  Cohesivo  : {score_coh:.1f}")
+    print(f"  Moderado  : {score_mod:.1f}")
+    print(f"  Mezclado  : {score_mix:.1f}")
+    diff = score_coh - score_mix
+    print(f"  Diferencia cohesivo - mezclado: {diff:.1f}")
+
+    print()
+    if diff >= 3:
+        print("✓ El LLM distingue bien entre cohesivo y mezclado.")
+        print("  llm_weight puede usarse con confianza en pipeline.py.")
+    elif diff >= 1:
+        print("⚠ El LLM distingue poco. Diferencia < 3.")
+        print("  Recomendación: reducir llm_weight a 0.2 o menos.")
+        print("  Documenta esta limitación en el informe.")
+    else:
+        print("✗ El LLM NO distingue entre cohesivo y mezclado.")
+        print("  Recomendación: usar llm_weight=0.0 (solo embeddings)")
+        print("  o probar con un modelo mayor.")
+        print("  Documenta esta limitación en el informe.")
+
+    stats = get_cache_stats()
+    print(f"\nLlamadas LLM: {stats['misses']} | Tiempo estimado: {stats['misses'] * 10}s aprox.")
+
+
+if __name__ == "__main__":
+    run_calibration()
+</file>
+
+<file path="test_prompts.py">
+"""
+test_prompts.py
+---------------
+Prueba 3 estilos de prompt distintos para encontrar cuál hace que
+deepseek-local:1.5b distinga entre texto cohesivo y texto mezclado.
+"""
+
+import re
+import requests
+import time
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL      = "deepseek-local:1.5b"
+
+# ---------------------------------------------------------------------------
+# Textos de prueba
+# ---------------------------------------------------------------------------
+
+COHESIVE_TEXT = (
+    "La fotosíntesis es el proceso por el cual las plantas convierten luz solar en energía química. "
+    "Las plantas capturan la luz mediante la clorofila, un pigmento verde presente en los cloroplastos. "
+    "Durante la fotosíntesis se producen glucosa y oxígeno a partir de dióxido de carbono y agua. "
+    "La glucosa sirve como fuente de energía para el crecimiento de la planta. "
+    "Sin fotosíntesis, la producción de oxígeno en la Tierra sería imposible."
+)
+
+MIXED_TEXT = (
+    "La fotosíntesis convierte la luz solar en energía química almacenada en glucosa. "
+    "El Imperio romano dominó gran parte de Europa, el norte de África y el Medio Oriente. "
+    "La Vía Láctea es una galaxia espiral barrada con entre 200 y 400 mil millones de estrellas. "
+    "Las plantas usan la clorofila para absorber la energía lumínica necesaria. "
+    "Roma fundó instituciones que influyeron profundamente en el derecho occidental."
+)
+
+# ---------------------------------------------------------------------------
+# Prompts a probar
+# ---------------------------------------------------------------------------
+
+PROMPTS = {
+    "A — Pregunta directa con escala": (
+        "En una escala del 1 al 10, ¿qué tan cohesionado temáticamente es este texto?\n"
+        "1 = trata varios temas sin relación. 10 = trata un único tema de principio a fin.\n"
+        "Responde SOLO con el número al final.\n\n"
+        "Texto: {texto}\n\n"
+        "Puntuación:"
+    ),
+    "B — Explicación breve y escala": (
+        "Lee este texto y evalúa si trata un solo tema o mezcla varios.\n"
+        "Piensa brevemente en tu decisión y luego da una puntuación del 1 al 10.\n"
+        "1 = Temas mezclados, 10 = Un solo tema coherente.\n\n"
+        "Texto: {texto}\n\n"
+        "Respuesta:"
+    ),
+    "C — Instrucción en inglés (recomendado)": (
+        "Rate the thematic coherence of this text from 1 to 10.\n"
+        "1 = completely unrelated topics mixed together.\n"
+        "10 = all sentences discuss exactly the same topic.\n"
+        "Briefly explain your reasoning, then reply with the final number.\n\n"
+        "Text: {texto}\n\n"
+        "Score:"
+    ),
+    "D — Strict role and constraint": (
+        "You are an expert text analyzer. Your task is to rate the thematic cohesion of the text.\n"
+        "Rules:\n"
+        "- If the text discusses a SINGLE topic consistently, score it 10.\n"
+        "- If the text abruptly switches topics or mixes completely unrelated subjects, score it 1.\n"
+        "Briefly explain your thought process, then output the final score.\n\n"
+        "Text: {texto}\n\n"
+        "Score:"
+    ),
+    "E — Few-shot examples (Highly Recommended)": (
+        "Rate the thematic cohesion from 1 (mixed topics) to 10 (single topic).\n\n"
+        "Example 1:\n"
+        "Text: The sun is a star. Cars need fuel to run. Water freezes at zero degrees.\n"
+        "Score: 1\n\n"
+        "Example 2:\n"
+        "Text: Mitochondria is the powerhouse of the cell. It generates most of the cell's supply of ATP, used as a source of chemical energy.\n"
+        "Score: 10\n\n"
+        "Now rate this text.\n"
+        "Text: {texto}\n\n"
+        "Score:"
+    ),
+    "F — Chain of Thought trigger": (
+        "Determine if the following text is thematically cohesive (discusses one topic) or mixed (discusses multiple unrelated topics).\n"
+        "Step 1: Identify the main topics.\n"
+        "Step 2: Decide if they are related or completely different.\n"
+        "Step 3: Assign a score (10 for purely cohesive, 1 for heavily mixed).\n\n"
+        "Text: {texto}\n\n"
+        "Score:"
+    ),
+}
+
+def call_llm(prompt: str, num_predict: int = 300) -> str:
+    """Aumentamos num_predict a 300 para darle espacio a la fase de <think>"""
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": num_predict,
+        }
+    }
+    t0 = time.time()
+    response = requests.post(OLLAMA_URL, json=payload, timeout=60)
+    response.raise_for_status()
+    elapsed = time.time() - t0
+    content = response.json().get("response", "").strip()
+    return content, elapsed
+
+
+def parse_score(response: str) -> float:
+    """Extrae el número final ignorando la fase de pensamiento."""
+    
+    # Si empezó a pensar pero nunca terminó, la respuesta está truncada
+    if "<think>" in response and "</think>" not in response:
+        print(" [!] Respuesta truncada por num_predict")
+        return -1.0
+        
+    # Borrar todo el bloque de razonamiento
+    clean_text = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+    
+    # Buscar números (del 1 al 10) en la respuesta limpia
+    numbers = re.findall(r'\b(10|[1-9])\b', clean_text)
+    if numbers:
+        return float(numbers[-1]) # Tomamos el último número emitido
+    
+    digits = re.findall(r'\d', clean_text)
+    if digits:
+        return float(min(10, max(1, int(digits[-1]))))
+        
+    return -1.0 
+
+
+def run_tests():
+    print("=" * 65)
+    print(f"PRUEBA DE PROMPTS — modelo: {MODEL}")
+    print("=" * 65)
+
+    results = {}
+
+    for prompt_name, prompt_template in PROMPTS.items():
+        print(f"\n{'─'*65}")
+        print(f"Prompt: {prompt_name}")
+        print(f"{'─'*65}")
+
+        for label, text in [("COHESIVO", COHESIVE_TEXT), ("MEZCLADO", MIXED_TEXT)]:
+            prompt = prompt_template.format(texto=text)
+            try:
+                # Le damos 300 tokens para que pueda pensar y responder
+                response, elapsed = call_llm(prompt, num_predict=300)
+                score = parse_score(response)
+                
+                status = f"{score:.0f}/10" if score >= 0 else "FALLO/TRUNCADO"
+                
+                # Mostrar un fragmento de la respuesta limpia para debug
+                clean_preview = re.sub(r'<think>.*?</think>', '[PENSAMIENTO OCULTO]', response, flags=re.DOTALL).replace('\n', ' ')
+                
+                print(f"  {label:<10}: {status} ({elapsed:.1f}s)")
+                print(f"  ↳ Raw: {clean_preview[:80]}...")
+                
+                results.setdefault(prompt_name, {})[label] = score
+            except Exception as e:
+                print(f"  {label:<10}: ERROR — {e}")
+                results.setdefault(prompt_name, {})[label] = -1
+
+    # Resumen
+    print(f"\n{'='*65}")
+    print("RESUMEN — ¿Qué prompt distingue mejor cohesivo vs mezclado?")
+    print(f"{'='*65}")
+    print(f"{'Prompt':<45} {'Cohesivo':>8} {'Mezclado':>8} {'Diff':>6}")
+    print(f"{'─'*45} {'─'*8} {'─'*8} {'─'*6}")
+
+    best_diff = -999
+    best_prompt = None
+
+    for pname, scores in results.items():
+        coh = scores.get("COHESIVO", -1)
+        mix = scores.get("MEZCLADO", -1)
+        diff = coh - mix if coh >= 0 and mix >= 0 else -999
+        label = "✓ MEJOR" if diff == max(
+            (s.get("COHESIVO", -1) - s.get("MEZCLADO", -1))
+            for s in results.values()
+        ) else ""
+        print(f"  {pname[:43]:<43} {coh:>8.1f} {mix:>8.1f} {diff:>+6.1f}  {label}")
+        if diff > best_diff:
+            best_diff = diff
+            best_prompt = pname
+
+    print()
+    if best_diff >= 3:
+        print(f"✓ Prompt '{best_prompt}' funciona bien (diff={best_diff:.1f}).")
+    elif best_diff >= 1:
+        print(f"⚠ Prompt '{best_prompt}' distingue poco (diff={best_diff:.1f}).")
+    else:
+        print("✗ Ningún prompt funciona bien con este modelo.")
+
+if __name__ == "__main__":
+    run_tests()
+</file>
+
+<file path=".gitignore">
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+env/
+venv/
+.env
+*.pyc
+dataset_synthetic.json
+dataset.json
+models/
+repomix-output.xml
+</file>
+
 <file path="embeddings.py">
 """
 embeddings.py
@@ -1314,12 +1538,6 @@ def get_ranked_candidates(
     sentences: list[str],
     model_path: str,
 ) -> list[tuple[int, float]]:
-    """
-    Devuelve TODAS las posiciones posibles de corte ordenadas
-    de más a menos prometedora (menor similitud = mejor candidato).
-    Retorna lista de tuplas (posición, similitud) ordenada ascendentemente.
-    Posición i significa corte entre oración i-1 e i.
-    """
     n = len(sentences)
     if n < 2:
         return []
@@ -1333,20 +1551,10 @@ def get_initial_cuts(
     ranked_candidates: list[tuple[int, float]],
     K: int,
 ) -> list[int]:
-    """
-    Selecciona los K-1 mejores candidatos como estado inicial para el SA.
-    Retorna lista ordenada de K-1 posiciones de corte.
-    """
     best = ranked_candidates[:K - 1]
     return sorted([pos for pos, _ in best])
 
 def find_local_valleys(similarities: list[float]) -> list[tuple[int, float]]:
-    """
-    Encuentra todos los mínimos locales estrictos en el perfil de similitud.
-    Retorna lista de (índice, profundidad) ordenada por profundidad descendente.
-    La profundidad se calcula como la diferencia entre la similitud en el valle
-    y el máximo de sus vecinos inmediatos.
-    """
     if len(similarities) < 3:
         return []
     sim_arr = np.array(similarities)
@@ -1359,13 +1567,7 @@ def find_local_valleys(similarities: list[float]) -> list[tuple[int, float]]:
     valleys.sort(key=lambda x: x[1], reverse=True)
     return valleys
 
-# ---------------------------------------------------------------------------
-# Evaluación agregada (para pruebas)
-# ---------------------------------------------------------------------------
-def evaluate_recall(
-    dataset: list[dict],
-    model_path: str,
-) -> dict:
+def evaluate_recall(dataset: list[dict], model_path: str) -> dict:
     recalls_k, recalls_2k = [], []
     for instance in dataset:
         sentences = instance["sentences"]
@@ -1381,9 +1583,6 @@ def evaluate_recall(
         "recall_2k": sum(recalls_2k) / len(recalls_2k),
     }
 
-# ---------------------------------------------------------------------------
-# Prueba standalone
-# ---------------------------------------------------------------------------
 def test_instance(instance: dict, model_path: str, model_label: str) -> None:
     sentences = instance["sentences"]
     K = instance["K"]
@@ -1448,11 +1647,14 @@ if __name__ == "__main__":
 </file>
 
 <file path="requirements.txt">
+# requirements.txt actualizado
 numpy
 sentence-transformers
 scipy
 requests
 wikipedia-api
+python-dotenv
+cerebras-cloud-sdk
 </file>
 
 <file path="simulated_annealing.py">
@@ -1824,27 +2026,13 @@ if __name__ == "__main__":
     print("Recall ≥ 80% es el objetivo mínimo para la Fase 1.")
 </file>
 
-<file path=".gitignore">
-.venv/
-__pycache__/
-.ipynb_checkpoints/
-env/
-venv/
-.env
-*.pyc
-dataset_synthetic.json
-dataset.json
-models/
-repomix-output.xml
-</file>
-
 <file path="adaptive_segmentation.py">
 """
 adaptive_segmentation.py
 -----------------------
 Funciones reutilizables para segmentación de texto:
 tokenización, cohesión de segmentos, scoring de embeddings,
-métrica F1 y CLI simple que invoca el pipeline principal.
+métrica F1 y CLI que invoca el pipeline avanzado.
 
 Uso:
   python adaptive_segmentation.py --dataset dataset.json --index 0
@@ -1872,7 +2060,7 @@ def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in parts if len(s.split()) >= 5]
 
 # ---------------------------------------------------------------------------
-# Cohesión de un segmento
+# Cohesión de un segmento (basada en embeddings)
 # ---------------------------------------------------------------------------
 def segment_cohesion(embeddings: np.ndarray, start: int, end: int) -> float:
     seg = embeddings[start:end]
@@ -1881,61 +2069,6 @@ def segment_cohesion(embeddings: np.ndarray, start: int, end: int) -> float:
     centroid = seg.mean(axis=0)
     sims = [cosine_similarity(emb, centroid) for emb in seg]
     return float(np.mean(sims))
-
-# ---------------------------------------------------------------------------
-# Cohesión por segmento de una partición (función compartida)
-# ---------------------------------------------------------------------------
-def compute_segment_cohesions(embeddings: np.ndarray, cuts: list[int], n: int) -> list[float]:
-    """
-    Calcula la cohesión (0-1) de cada segmento de una partición.
-
-    Esta función se comparte entre score_partition_embeddings (aquí) y
-    compute_partition_score_embeddings (simulated_annealing.py), que la
-    usa como función de coste dentro del bucle de Simulated Annealing
-    (sin llamar al LLM), evitando duplicar la lógica de cohesión.
-    """
-    boundaries = [0] + sorted(cuts) + [n]
-    K = len(boundaries) - 1
-    return [segment_cohesion(embeddings, boundaries[i], boundaries[i + 1]) for i in range(K)]
-
-# ---------------------------------------------------------------------------
-# Scoring de embeddings normalizado a [0,1]
-# ---------------------------------------------------------------------------
-def score_partition_embeddings(
-    embeddings: np.ndarray,
-    cuts: list[int],
-    n: int,
-    min_seg: int = 3,
-) -> float:
-    """
-    Evalúa una partición basada únicamente en embeddings.
-    Combina cohesión media, separación entre segmentos (1 - similitud de
-    centroides adyacentes) y penalización por segmentos cortos.
-    El resultado se normaliza dividiendo por un factor teórico máximo (1.5)
-    para llevarlo al rango [0,1].
-    """
-    boundaries = [0] + sorted(cuts) + [n]
-    K = len(boundaries) - 1
-    cohs = compute_segment_cohesions(embeddings, cuts, n)
-    centroids = [embeddings[boundaries[i]:boundaries[i + 1]].mean(axis=0) for i in range(K)]
-    mean_coh = np.mean(cohs)
-    # Separación: 1 - similitud coseno entre centroides adyacentes
-    seps = []
-    for i in range(K - 1):
-        sim = cosine_similarity(centroids[i], centroids[i + 1])
-        seps.append(1.0 - sim)
-    mean_sep = np.mean(seps) if seps else 0.0
-    # Penalización por segmentos muy cortos
-    penalty = 0.0
-    for i in range(K):
-        size = boundaries[i + 1] - boundaries[i]
-        if size < min_seg:
-            penalty += (min_seg - size) * 0.2
-    raw = mean_coh + 0.5 * mean_sep - penalty
-    # Normalización: el máximo teórico (sin penalización) es 1.0 + 0.5*1.0 = 1.5
-    normalized = raw / 1.5
-    # Asegurar que quede en [0,1]
-    return max(0.0, min(1.0, normalized))
 
 # ---------------------------------------------------------------------------
 # F1 con tolerancia
@@ -1964,23 +2097,27 @@ def compute_f1(
     return f1, precision, recall
 
 # ---------------------------------------------------------------------------
-# CLI (delega en pipeline.py)
+# CLI
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Segmentación óptima con LLM local")
+    parser = argparse.ArgumentParser(description="Segmentación óptima de contenido (Pipeline Avanzado)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--dataset", type=Path, help="Ruta a dataset.json")
     group.add_argument("--text-file", type=Path, help="Ruta a un .txt")
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--model", type=str, default=MODEL_B)
-    parser.add_argument("--min-seg", type=int, default=3)
-    parser.add_argument("--max-k", type=int, default=8)
-    parser.add_argument("--llm-weight", type=float, default=0.4)
-    parser.add_argument("--max-iter-cap", type=int, default=2000)
-    parser.add_argument("--output", type=Path)
+    parser.add_argument("--min-seg", type=int, default=3, help="Tamaño mínimo de segmento")
+    parser.add_argument("--lambda-penalty", type=float, default=3.0,
+                        help="Penalización estructural por segmento (favorece menos cortes)")
+    parser.add_argument("--max-seg-len", type=int, default=None,
+                        help="Longitud máxima de un segmento candidato (por defecto: max(min_seg*4, n//2))")
+    parser.add_argument("--min-cohesion", type=float, default=0.5,
+                        help="Cohesión mínima de embeddings para evaluar una arista con el LLM")
+    parser.add_argument("--embedding-weight", type=float, default=0.3,
+                        help="Peso de la cohesión de embeddings al combinar con el costo del LLM (0-1)")
+    parser.add_argument("--output", type=Path, help="Guardar resultado en JSON")
     args = parser.parse_args()
 
-    # Importar aquí para no obligar en import del módulo
     from pipeline import run_pipeline
 
     if args.dataset:
@@ -2000,13 +2137,14 @@ def main():
         sentences,
         model_path=args.model,
         min_seg=args.min_seg,
-        max_k=args.max_k,
-        llm_weight=args.llm_weight,
-        max_iter_cap=args.max_iter_cap,
+        lambda_penalty=args.lambda_penalty,
+        max_seg_len=args.max_seg_len,
+        min_cohesion=args.min_cohesion,
+        embedding_weight=args.embedding_weight,
     )
 
     print("=" * 62)
-    print("SEGMENTACION OPTIMA (pipeline integrado)")
+    print("SEGMENTACION OPTIMA (Pipeline Avanzado)")
     print("=" * 62)
     print(f"Instancia        : {title}")
     print(f"Oraciones        : {result['n_sentences']}")
@@ -2015,7 +2153,17 @@ def main():
     print(f"Cohesion media   : {result['cohesion_mean']:.4f}")
     print(f"Cohesion x seg.  : {[f'{c:.3f}' for c in result['seg_cohesions']]}")
     print(f"Llamadas LLM     : {result['total_llm_calls']}")
-    print(f"Score combinado  : {result['combined_score']:.4f}")
+
+    dp_stats = result.get("dp_stats", {})
+    cache_stats = result.get("cache_stats", {})
+    if dp_stats:
+        print(f"\nAristas totales      : {dp_stats['edges_total']}")
+        print(f"  podadas (longitud) : {dp_stats['edges_pruned_length']}")
+        print(f"  podadas (cohesión) : {dp_stats['edges_pruned_cohesion']}")
+        print(f"  evaluadas con LLM  : {dp_stats['edges_evaluated_llm']}")
+    if cache_stats:
+        print(f"  respuestas truncadas (<think> sin cerrar): "
+              f"{cache_stats.get('truncated', 0)} / {dp_stats.get('edges_evaluated_llm', 0)}")
 
     if gt_cuts:
         f1, p, r = compute_f1(result["best_cuts"], gt_cuts, tolerance=1)
@@ -2042,6 +2190,7 @@ def main():
             "cohesion_mean": result["cohesion_mean"],
             "llm_calls": result["total_llm_calls"],
             "n_sentences": result["n_sentences"],
+            "dp_stats": dp_stats,
         }
         if gt_cuts:
             f1, p, r = compute_f1(result["best_cuts"], gt_cuts, tolerance=1)
@@ -2057,126 +2206,124 @@ if __name__ == "__main__":
 """
 llm_evaluator.py
 ----------------
-Evalúa la cohesión semántica de segmentos de texto usando
-un LLM local con Ollama (modelo deepseek-local:1.5b).
-
-Nota sobre la arquitectura (ver simulated_annealing.py y pipeline.py):
-  El LLM YA NO se usa dentro del bucle de Simulated Annealing. Se usa
-  ÚNICAMENTE al final del pipeline, evaluando K segmentos por cada K
-  candidato. suggest_move y judge_boundary quedan disponibles pero sin
-  uso en el flujo principal.
-
-Requisitos:
-    pip install requests
-
-Uso como módulo:
-    from llm_evaluator import evaluate_segment, suggest_move, judge_boundary
+Evaluador de cohesión semántica para segmentos de texto.
+Utiliza la API de Cerebras (modelo gpt-oss-120b) con prompt optimizado.
 """
 
-import json
 import os
 import re
 import time
-from pathlib import Path
 import requests
 from dotenv import load_dotenv
-from cerebras.cloud.sdk import Cerebras
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
-OLLAMA_URL  = "http://localhost:11434/api/generate"
-MODEL       = "deepseek-local:1.5b"
-MAX_RETRIES = 2
-RETRY_DELAY = 3.0
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+if not CEREBRAS_API_KEY:
+    raise EnvironmentError("CEREBRAS_API_KEY no encontrada en el archivo .env")
 
-# Cache global
+CEREBRAS_API_URL = "https://api.cerebras.ai/v1/chat/completions"
+MODEL = "gpt-oss-120b"
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 2.0
+TIMEOUT = 60
+MAX_TOKENS = 100000          # alto para evitar truncamiento
+
+# Caché de evaluaciones
 _eval_cache: dict[tuple, float] = {}
-_cache_hits   = 0
+_cache_hits = 0
 _cache_misses = 0
 
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
-
-# EVAL_PROMPT mejorado con anclas de referencia para mejor calibración:
-# - 1-2: texto que mezcla temas completamente distintos sin relación
-# - 9-10: texto que trata un único tema de principio a fin
-# Esto reduce el sesgo hacia puntuaciones altas en modelos pequeños.
-EVAL_PROMPT = """En una escala del 1 al 10, ¿qué tan cohesionado temáticamente es este texto?
-1 = trata varios temas sin relación. 10 = trata un único tema de principio a fin.
-Responde SOLO con el número.
-
-Texto: {texto}
-
-Puntuación:"""
-
-SUGGEST_PROMPT = """Fragmento A: {seg_izq}
-Fragmento B: {seg_der}
-
-El corte entre A y B, ¿está bien colocado?
-Responde SOLO con una palabra: IZQUIERDA, DERECHA o MANTENER.
-Respuesta:"""
-
-BOUNDARY_PROMPT = """Fragmento 1: {seg_izq}
-Fragmento 2: {seg_der}
-
-¿Tratan estos dos fragmentos temas distintos?
-Responde SOLO con SI o NO.
-Respuesta:"""
-
 
 # ---------------------------------------------------------------------------
-# Llamada al LLM local
+# Llamada a la API de Cerebras
 # ---------------------------------------------------------------------------
-
-def _call_llm(prompt: str, timeout: int = 60) -> str:
-    """
-    Llama a Ollama local via /api/generate.
-    num_predict=5 — solo necesitamos 1-2 tokens para el número.
-    Sin stop tokens para no cortar la respuesta antes del número.
-    """
+def _call_llm(prompt: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {CEREBRAS_API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {
         "model": MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.0,
-            "num_predict": 15,  # suficiente para capturar el número + breve explicación
-        }
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+        "max_tokens": MAX_TOKENS,
     }
-    t0 = time.time()
+    last_error = None
     for attempt in range(MAX_RETRIES):
         try:
-            response = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+            response = requests.post(
+                CEREBRAS_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=TIMEOUT
+            )
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                wait = int(retry_after) if retry_after else 10
+                print(f"\n  [LLM] Rate limit. Esperando {wait}s...")
+                time.sleep(wait)
+                continue
+
             response.raise_for_status()
-            data    = response.json()
-            content = data.get("response", "").strip()
+            data = response.json()
+
+            if "choices" not in data or len(data["choices"]) == 0:
+                raise ValueError(f"Respuesta sin choices: {data}")
+
+            choice = data["choices"][0]
+            content = choice.get("message", {}).get("content", "").strip()
+
             if not content:
                 raise ValueError("Respuesta vacía del LLM")
-            elapsed = time.time() - t0
-            if elapsed > 5:
-                print(f"[!] LLM tardó {elapsed:.1f}s", end=" ", flush=True)
+
             return content
+
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            print(f"\n  [LLM] Error de red intento {attempt+1}: {e}")
+        except (KeyError, ValueError, IndexError) as e:
+            last_error = e
+            print(f"\n  [LLM] Error de parsing intento {attempt+1}: {e}")
         except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                print(f"  [LLM] Error intento {attempt+1}: {e}. Reintentando...")
-                time.sleep(RETRY_DELAY)
-            else:
-                raise RuntimeError(f"LLM falló tras {MAX_RETRIES} intentos: {e}")
+            last_error = e
+            print(f"\n  [LLM] Error inesperado intento {attempt+1}: {e}")
+
+        wait = RETRY_DELAY_BASE * (2 ** attempt)
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(wait)
+
+    raise RuntimeError(f"Fallo en llamada a Cerebras tras {MAX_RETRIES} intentos: {last_error}")
 
 
 # ---------------------------------------------------------------------------
-# Parsing de respuestas
+# Construcción del prompt
 # ---------------------------------------------------------------------------
+PROMPT_TEMPLATE = """You are a ruthless text segmentation algorithm. Your job is to analyze the following text and determine if it is homogeneous or if it contains a thematic shift.
 
+Rules:
+- Score 10.0 ONLY if the text is 100% homogeneous (e.g., all sentences describe the exact same physical structure, OR all sentences describe the exact same step in a process).
+- Score 2.0 if the text transitions between sub-topics (e.g., from author A to author B, from historical context to physical measurement, or from one century to another).
+
+Text to analyze:
+{texto}
+
+Put your reasoning inside <think></think> tags. Output your final decision exactly as: [SCORE: X.X]"""
+
+
+def _build_prompt(text_content: str) -> str:
+    return PROMPT_TEMPLATE.format(texto=text_content)
+
+
+# ---------------------------------------------------------------------------
+# Extracción del score numérico
+# ---------------------------------------------------------------------------
 def _parse_score(response: str) -> float:
-    """
-    Extrae el primer número 1-10 de la respuesta.
-    Si no encuentra ninguno, devuelve 5.0 (neutro).
-    """
     numbers = re.findall(r'\b(10|[1-9])\b', response)
     if numbers:
         return float(numbers[0])
@@ -2186,225 +2333,57 @@ def _parse_score(response: str) -> float:
     return 5.0
 
 
-def _parse_bool(response: str) -> bool:
-    """Parsea SI/NO. Por defecto True (conservador)."""
-    upper = response.upper()
-    if upper.startswith("NO") or upper.startswith("N "):
-        return False
-    return True
-
-
-def _make_cache_key(sentences: list[str], start: int, end: int) -> tuple:
-    text = " ".join(sentences[start:end])
-    return (start, end, hash(text))
-
-
 # ---------------------------------------------------------------------------
-# Funciones principales
+# Evaluación de cohesión de un segmento
 # ---------------------------------------------------------------------------
-
-def evaluate_segment(
-    sentences: list[str],
-    start: int,
-    end: int,
-    verbose: bool = False,
-) -> float:
-    """
-    Evalúa la cohesión semántica de un segmento (1-10).
-    Usa cache para evitar llamadas repetidas.
-    Devuelve 5.0 si la API falla.
-
-    En el pipeline actual se llama UNA VEZ por segmento de la partición
-    final de cada K candidato (no dentro del bucle de SA).
-    """
+def evaluate_segment(sentences: list[str], start: int, end: int) -> float:
     global _cache_hits, _cache_misses
 
     if start >= end:
         return 0.0
 
-    key = _make_cache_key(sentences, start, end)
+    text_content = " ".join(sentences[start:end])
+    key = (start, end, hash(text_content))
+
     if key in _eval_cache:
         _cache_hits += 1
         return _eval_cache[key]
 
     _cache_misses += 1
+    prompt = _build_prompt(text_content)
 
-    texto = " ".join(sentences[start:end])
-    words = texto.split()
-    if len(words) > 300:
-        texto = " ".join(words[:300]) + "..."
-
-    prompt = EVAL_PROMPT.format(texto=texto)
-
-    n_words = len(texto.split())
-    print(f"  [LLM] [{start}:{end}] ({end-start} seg, {n_words} words)...", end=" ", flush=True)
+    print(f"  [LLM] Evaluando ({start:02d} -> {end:02d})...", end=" ", flush=True)
 
     try:
         response = _call_llm(prompt)
-    except RuntimeError:
-        print("FALLO → 5.0")
-        return 5.0
-
-    score = _parse_score(response)
-    print(f"→ '{response[:20].strip()}' → {score:.1f}")
-
-    if verbose:
-        print(f"  [LLM detalle] [{start}:{end}] → '{response}' → {score:.1f}")
+        score = _parse_score(response)
+        print(f"Score: {score}")
+    except RuntimeError as e:
+        print(f"FALLO: {e} -> Score: 5.0")
+        score = 5.0
 
     _eval_cache[key] = score
     return score
 
 
-def evaluate_partition(
-    sentences: list[str],
-    cuts: list[int],
-    verbose: bool = False,
-) -> tuple[float, list[float]]:
-    """Evalúa una partición completa."""
-    n          = len(sentences)
-    boundaries = [0] + cuts + [n]
-    scores     = []
-    for i in range(len(boundaries) - 1):
-        start = boundaries[i]
-        end   = boundaries[i + 1]
-        score = evaluate_segment(sentences, start, end, verbose=verbose)
-        scores.append(score)
-        if verbose:
-            print(f"  Segmento {i+1} [{start}:{end}]: {score:.1f}/10")
-    return sum(scores), scores
-
-
-def suggest_move(
-    sentences: list[str],
-    cuts: list[int],
-    cut_index: int,
-) -> str:
-    """
-    Sugiere si un corte debería moverse (IZQUIERDA, DERECHA, MANTENER).
-    NOTA: sin uso en el pipeline principal. Se conserva como variante experimental.
-    """
-    n             = len(sentences)
-    boundaries    = [0] + cuts + [n]
-    cut_pos       = cuts[cut_index]
-    seg_izq_start = boundaries[cut_index]
-    seg_der_end   = boundaries[cut_index + 2]
-    MAX_CTX = 3
-    seg_izq = sentences[max(seg_izq_start, cut_pos - MAX_CTX) : cut_pos]
-    seg_der = sentences[cut_pos : min(seg_der_end, cut_pos + MAX_CTX)]
-    prompt = SUGGEST_PROMPT.format(
-        seg_izq=" ".join(seg_izq),
-        seg_der=" ".join(seg_der),
-    )
-    try:
-        response = _call_llm(prompt)
-    except RuntimeError:
-        return "MANTENER"
-    upper = response.upper()
-    if "IZQUIERDA" in upper:
-        return "IZQUIERDA"
-    elif "DERECHA" in upper:
-        return "DERECHA"
-    return "MANTENER"
-
-
-def judge_boundary(
-    sentences: list[str],
-    cut: int,
-    window: int = 3,
-) -> bool:
-    """
-    Decide si una posición es una frontera temática real (True=sí, False=no).
-    NOTA: sin uso en el pipeline principal. Se conserva como filtro adicional opcional.
-    """
-    n = len(sentences)
-    seg_izq = sentences[max(0, cut - window) : cut]
-    seg_der = sentences[cut : min(n, cut + window)]
-    if not seg_izq or not seg_der:
-        return True
-    seg_izq_text = " ".join(seg_izq[-2:])
-    seg_der_text = " ".join(seg_der[:2])
-    prompt = BOUNDARY_PROMPT.format(seg_izq=seg_izq_text, seg_der=seg_der_text)
-    print(f"  [LLM] judge_boundary corte={cut}...", end=" ", flush=True)
-    try:
-        response = _call_llm(prompt)
-    except RuntimeError:
-        print("FALLO → True")
-        return True
-    result = _parse_bool(response)
-    print(f"→ '{response[:15]}' → {'SI' if result else 'NO'}")
-    return result
-
-
 # ---------------------------------------------------------------------------
-# Cache stats
+# Gestión de caché
 # ---------------------------------------------------------------------------
-
-def get_cache_stats() -> dict:
-    total = _cache_hits + _cache_misses
-    return {
-        "hits":            _cache_hits,
-        "misses":          _cache_misses,
-        "total_calls":     total,
-        "hit_rate":        _cache_hits / total if total > 0 else 0.0,
-        "llm_calls_saved": _cache_hits,
-    }
-
-
-def reset_cache() -> None:
+def reset_cache():
     global _eval_cache, _cache_hits, _cache_misses
     _eval_cache.clear()
-    _cache_hits   = 0
+    _cache_hits = 0
     _cache_misses = 0
 
 
-# ---------------------------------------------------------------------------
-# Prueba standalone
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("PRUEBA LLM LOCAL")
-    print("=" * 60)
-
-    print("\nTest 1: conexión básica...")
-    try:
-        resp = _call_llm("Responde SOLO con el número 7.", timeout=30)
-        print(f"  Respuesta raw: '{resp}'")
-        print(f"  Score parseado: {_parse_score(resp)}")
-    except Exception as e:
-        print(f"  FALLO: {e}")
-        print("  Verifica que Ollama está corriendo: ollama serve")
-        exit(1)
-
-    print("\nTest 2: evaluate_segment (cohesivo)...")
-    cohesive = [
-        "La fotosíntesis convierte luz solar en energía química.",
-        "Las plantas usan clorofila para capturar la luz.",
-        "El proceso produce oxígeno y glucosa como subproductos.",
-        "Sin fotosíntesis, la vida vegetal en la Tierra no sería posible.",
-    ]
-    score_coh = evaluate_segment(cohesive, 0, len(cohesive), verbose=False)
-    print(f"  Score cohesivo (esperado ~7-10): {score_coh}")
-
-    print("\nTest 3: evaluate_segment (mezclado)...")
-    mixed = [
-        "La fotosíntesis convierte luz solar en energía química.",
-        "El Imperio romano dominó el Mediterráneo durante siglos.",
-        "La Vía Láctea es una galaxia espiral barrada.",
-        "Las plantas producen oxígeno mediante la clorofila.",
-    ]
-    score_mix = evaluate_segment(mixed, 0, len(mixed), verbose=False)
-    print(f"  Score mezclado (esperado ~1-4): {score_mix}")
-
-    print(f"\n{'─'*60}")
-    if score_coh > score_mix + 2:
-        print(f"✓ El LLM distingue bien: cohesivo={score_coh} vs mezclado={score_mix}")
-    else:
-        print(f"⚠ El LLM NO distingue bien: cohesivo={score_coh} vs mezclado={score_mix}")
-        print("  Considera bajar llm_weight en pipeline.py o documentar la limitación.")
-
-    stats = get_cache_stats()
-    print(f"\nLlamadas LLM: {stats['misses']} | Cache hits: {stats['hits']}")
+def get_cache_stats() -> dict:
+    total = _cache_hits + _cache_misses
+    hit_rate = (_cache_hits / total) if total > 0 else 0.0
+    return {
+        "hits": _cache_hits,
+        "misses": _cache_misses,
+        "hit_rate": hit_rate,
+    }
 </file>
 
 </files>
