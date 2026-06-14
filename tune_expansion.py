@@ -2,9 +2,7 @@
 tune_expansion.py
 -----------------
 Encuentra el valor óptimo de expansion para la Fase 1.
-
-Prueba varios valores de expansion y mide el recall promedio
-sobre todo el dataset para ambos modelos.
+Prueba varios valores y mide el recall promedio sobre el dataset.
 
 Uso:
     python tune_expansion.py
@@ -12,20 +10,38 @@ Uso:
 
 import json
 from pathlib import Path
-from embeddings import get_cut_candidates, MODEL_A, MODEL_B
+from embeddings import get_ranked_candidates, MODEL_A, MODEL_B
 
 
-def evaluate_expansion(dataset: list[dict], model_path: str, model_label: str, expansions: list[int]) -> None:
+def get_cut_candidates(
+    sentences: list[str],
+    K: int,
+    model_path: str,
+    expansion: int = 2,
+) -> list[int]:
+    """
+    Wrapper de compatibilidad: devuelve los top (K-1)*expansion candidatos
+    del ranking de get_ranked_candidates.
+    """
+    ranked = get_ranked_candidates(sentences, model_path)
+    M = min((K - 1) * expansion, len(ranked))
+    return sorted([pos for pos, _ in ranked[:M]])
+
+
+def evaluate_expansion(
+    dataset: list[dict],
+    model_path: str,
+    model_label: str,
+    expansions: list[int],
+) -> None:
     print(f"\n{'─'*60}")
     print(f"Modelo: {model_label}")
     print(f"{'─'*60}")
-    print(f"{'Expansion':>10} | {'Recall %':>8} | {'Candidatos promedio':>20} | {'% espacio':>10}")
-    print(f"{'─'*10}-+-{'─'*8}-+-{'─'*20}-+-{'─'*10}")
+    print(f"{'Expansion':>10} | {'Recall %':>8} | {'Candidatos':>12} | {'% espacio':>10}")
+    print(f"{'─'*10}-+-{'─'*8}-+-{'─'*12}-+-{'─'*10}")
 
     for expansion in expansions:
-        recalls = []
-        n_candidates_list = []
-        space_reductions = []
+        recalls, n_cands, spaces = [], [], []
 
         for instance in dataset:
             sentences = instance["sentences"]
@@ -33,19 +49,17 @@ def evaluate_expansion(dataset: list[dict], model_path: str, model_label: str, e
             gt_cuts   = set(instance["ground_truth_cuts"])
             n         = instance["n_sentences"]
 
-            candidates = get_cut_candidates(sentences, K, model_path, expansion=expansion)
+            candidates = get_cut_candidates(sentences, K, model_path, expansion)
             cand_set   = set(candidates)
 
             recall = len(gt_cuts & cand_set) / len(gt_cuts) if gt_cuts else 0.0
             recalls.append(recall)
-            n_candidates_list.append(len(candidates))
-            space_reductions.append(len(candidates) / (n - 1) if n > 1 else 1.0)
+            n_cands.append(len(candidates))
+            spaces.append(len(candidates) / (n - 1) if n > 1 else 1.0)
 
-        avg_recall     = sum(recalls) / len(recalls)
-        avg_candidates = sum(n_candidates_list) / len(n_candidates_list)
-        avg_space      = sum(space_reductions) / len(space_reductions)
-
-        print(f"{expansion:>10} | {avg_recall*100:>7.1f}% | {avg_candidates:>20.1f} | {avg_space*100:>9.1f}%")
+        print(f"{expansion:>10} | {sum(recalls)/len(recalls)*100:>7.1f}% | "
+              f"{sum(n_cands)/len(n_cands):>12.1f} | "
+              f"{sum(spaces)/len(spaces)*100:>9.1f}%")
 
 
 if __name__ == "__main__":
@@ -64,11 +78,11 @@ if __name__ == "__main__":
 
     expansions = [2, 3, 4, 5, 6, 8, 10]
 
-    for model_label, model_path in [("Modelo A (MiniLM)", MODEL_A), ("Modelo B (mpnet)", MODEL_B)]:
-        evaluate_expansion(dataset, model_path, model_label, expansions)
+    for label, path in [("Modelo A (MiniLM)", MODEL_A), ("Modelo B (mpnet)", MODEL_B)]:
+        if Path(path).exists():
+            evaluate_expansion(dataset, path, label, expansions)
+        else:
+            print(f"  [!] {label} no encontrado, se omite.")
 
     print(f"\n{'─'*60}")
-    print("Interpretación:")
-    print("  Recall    → % de cortes reales capturados (queremos ≥ 80%)")
-    print("  Candidatos → cuántas posiciones pasan al SA (menos = más rápido)")
-    print("  % espacio  → qué fracción del espacio total representan")
+    print("Recall ≥ 80% es el objetivo mínimo para la Fase 1.")

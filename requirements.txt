@@ -1,4 +1,5 @@
-wikipedia-api
-nltk
 numpy
-sentence_transformers
+sentence-transformers
+scipy
+requests
+wikipedia-api
