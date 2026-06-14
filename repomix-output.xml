@@ -898,222 +898,6 @@ models/
 repomix-output.xml
 </file>
 
-<file path="dp_segmentation.py">
-"""
-dp_segmentation.py
-------------------
-Segmentación Multiescala Adaptativa con búsqueda binaria guiada por LLM.
-
-Arquitectura:
-  1. Se evalúa el segmento completo con el LLM (dos fases en llm_evaluator).
-  2. Si score >= score_threshold → segmento cohesivo → NO recursionar.
-     El segmento se acepta tal cual, sin buscar subcortes.
-  3. Si score < score_threshold → segmento mezclado → recursionar:
-     a. Se busca el valle más profundo (embeddings) dentro del rango.
-     b. Se divide el segmento en dos mitades por ese valle.
-     c. Se repite el proceso en cada mitad de forma independiente.
-
-Ventajas de esta búsqueda binaria guiada:
-  - Los segmentos cohesivos NO generan llamadas adicionales al LLM.
-  - Solo los segmentos mezclados se subdividen, reduciendo llamadas totales.
-  - El umbral score_threshold controla la agresividad de la segmentación.
-
-Integración con llm_evaluator (dos fases):
-  - Fase 1 (prompt suave): detecta casos claros (muy mezclado / muy cohesivo).
-  - Fase 2 (prompt estricto): se activa solo si Fase 1 da score alto,
-    buscando subtemas ocultos. El score final es min(suave, estricto).
-  - Si score_final >= score_threshold → cohesivo → parar recursión.
-  - Si score_final < score_threshold → mezclado → buscar corte y dividir.
-"""
-
-from __future__ import annotations
-import numpy as np
-from embeddings import cosine_similarity, compute_similarity_profile, find_local_valleys
-from llm_evaluator import evaluate_segment, select_evaluation_mode, GLOBAL_SCORE_THRESHOLD
-
-
-def _find_best_valley_in_range(
-    valley_cuts: list[tuple[int, float]],
-    embeddings: np.ndarray,
-    start: int,
-    end: int,
-    min_seg: int,
-) -> int:
-    """
-    Encuentra el mejor punto de corte dentro de [start, end).
-
-    Estrategia:
-      1. Buscar en los valles globales precomputados (más eficiente).
-      2. Si ningún valle global cae en el rango (común en sub-rangos
-         pequeños tras varios niveles de recursión), hacer búsqueda local
-         del mínimo de similitud coseno como fallback.
-
-    Retorna la posición del mejor corte, o -1 si no es posible cortar
-    respetando min_seg.
-    """
-    # 1. Valles globales ordenados por profundidad (descendente)
-    for pos, _depth in valley_cuts:
-        if start + min_seg <= pos <= end - min_seg:
-            return pos
-
-    # 2. Fallback: mínimo local de similitud coseno en el rango
-    best_cut = -1
-    min_sim  = float('inf')
-    for i in range(start + min_seg, end - min_seg + 1):
-        sim = cosine_similarity(embeddings[i - 1], embeddings[i])
-        if sim < min_sim:
-            min_sim  = sim
-            best_cut = i
-
-    return best_cut
-
-
-def _recursive_segment(
-    sentences: list[str],
-    embeddings: np.ndarray,
-    start: int,
-    end: int,
-    min_seg: int,
-    score_threshold: float,
-    valley_cuts: list[tuple[int, float]],
-    stats: dict,
-    depth: int = 0,
-) -> list[int]:
-    """
-    Segmentación recursiva (búsqueda binaria guiada por LLM).
-
-    Para cada bloque [start, end):
-      1. Evaluar cohesión con LLM (dos fases).
-      2. Si score >= score_threshold → cohesivo → devolver [] (sin cortes).
-      3. Si score < score_threshold → mezclado:
-         a. Encontrar el mejor valle en el rango.
-         b. Dividir en [start, cut) y [cut, end).
-         c. Recursionar en cada mitad.
-
-    Parámetros:
-      depth : nivel de recursión (para logging con indentación)
-    """
-    indent = "  " * (depth + 1)
-
-    # Condición de parada: bloque demasiado pequeño para dividir
-    if (end - start) < (min_seg * 2):
-        print(f"{indent}[Recursión] Bloque [{start},{end}) demasiado pequeño → parar")
-        return []
-
-    stats["edges_evaluated_llm"] += 1
-    score = evaluate_segment(sentences, start, end)
-
-    if score >= score_threshold:
-        # Segmento cohesivo: NO recursionar, NO buscar subcortes
-        print(f"{indent}[Recursión] [{start},{end}) cohesivo (score={score:.1f}) → aceptar sin cortes")
-        return []
-
-    # Segmento mezclado: buscar el mejor corte y dividir
-    print(f"{indent}[Recursión] [{start},{end}) mezclado (score={score:.1f}) → buscando corte...")
-    best_cut = _find_best_valley_in_range(valley_cuts, embeddings, start, end, min_seg)
-
-    if best_cut == -1:
-        print(f"{indent}[Recursión] No se encontró corte válido en [{start},{end}) → parar")
-        return []
-
-    print(f"{indent}[Recursión] Corte en posición {best_cut} → dividiendo [{start},{best_cut}) y [{best_cut},{end})")
-
-    cuts_left  = _recursive_segment(sentences, embeddings, start,    best_cut, min_seg, score_threshold, valley_cuts, stats, depth + 1)
-    cuts_right = _recursive_segment(sentences, embeddings, best_cut, end,      min_seg, score_threshold, valley_cuts, stats, depth + 1)
-
-    return sorted(set(cuts_left + [best_cut] + cuts_right))
-
-
-def run_dp_segmentation(
-  sentences: list[str],
-  embeddings: np.ndarray,
-  min_seg: int = 3,
-  **kwargs,
-) -> tuple[list[int], dict]:
-  """
-  Función principal del motor de segmentación.
-
-  Flujo:
-    0. Evaluación Inicial: select_evaluation_mode() puntúa la calidad/
-     coherencia global del texto (0-10) y fija el modo de prompt
-     ("strict" si score_global >= GLOBAL_SCORE_THRESHOLD, "soft" en
-     caso contrario) para TODA la ejecución.
-    1. Precomputar perfil de similitud y valles globales (una sola vez).
-    2. Evaluar el texto completo con el LLM, usando el modo ya fijado.
-    3. Si cohesivo (score >= score_threshold) → devolver sin cortes.
-     Si mezclado → iniciar recursión con búsqueda binaria guiada,
-     donde TODOS los subsegmentos se evalúan con el mismo modo.
-
-  Parámetros kwargs:
-    score_threshold : umbral de cohesión para parar la recursión
-            (default 7.0). Es independiente de
-            GLOBAL_SCORE_THRESHOLD (que decide el modo de
-            prompt); score_threshold decide cuándo dejar de
-            dividir un bloque.
-
-  Retorna:
-    (cortes_finales, estadísticas)
-  """
-  n               = len(sentences)
-  score_threshold = kwargs.get("score_threshold", 7.0)
-
-  stats = {
-    "edges_evaluated_llm":   0,
-    "edges_total":           0,
-    "edges_pruned_length":   0,
-    "edges_pruned_cohesion": 0,
-    "evaluation_mode":       None,
-    "global_score":          None,
-  }
-
-  # 0. Evaluación Inicial: decide el modo de prompt para toda la ejecución
-  mode, global_score = select_evaluation_mode(sentences)
-  stats["evaluation_mode"] = mode
-  stats["global_score"]    = global_score
-  stats["edges_evaluated_llm"] += 1
-  print(f"  [DP] Escenario {'A (estricto)' if mode == 'strict' else 'B (suave)'}: "
-      f"score_global={global_score:.1f} (umbral={GLOBAL_SCORE_THRESHOLD}) → modo='{mode}'")
-
-  # 1. Precomputar valles globales UNA SOLA VEZ
-  similarities = compute_similarity_profile(embeddings)
-  raw_valleys  = find_local_valleys(similarities)
-  valley_cuts  = [(idx + 1, depth) for idx, depth in raw_valleys]
-
-  print(f"  [DP] Valles precomputados (por profundidad): "
-      f"{[pos for pos, _ in valley_cuts]}")
-  print(f"  [DP] score_threshold={score_threshold} | min_seg={min_seg}")
-
-  # 2. Evaluación inicial del texto completo, con el modo ya fijado
-  stats["edges_evaluated_llm"] += 1
-  score_total = evaluate_segment(sentences, 0, n)
-
-  if score_total >= score_threshold:
-    print(f"  [DP] Texto completo cohesivo (score={score_total:.1f}) → sin cortes")
-    stats["edges_total"] = stats["edges_evaluated_llm"]
-    return [], stats
-
-  # 3. Texto mezclado → recursión con búsqueda binaria, modo consistente
-  print(f"  [DP] Texto mezclado (score={score_total:.1f}) → iniciando segmentación recursiva...")
-  final_cuts = _recursive_segment(
-    sentences       = sentences,
-    embeddings      = embeddings,
-    start           = 0,
-    end             = n,
-    min_seg         = min_seg,
-    score_threshold = score_threshold,
-    valley_cuts     = valley_cuts,
-    stats           = stats,
-    depth           = 0,
-  )
-
-  stats["edges_total"] = stats["edges_evaluated_llm"]
-
-  print(f"  [DP] Segmentación completada. Cortes: {final_cuts} "
-      f"| LLM calls: {stats['edges_evaluated_llm']} | modo='{mode}'")
-
-  return sorted(set(final_cuts)), stats
-</file>
-
 <file path="pipeline.py">
 """
 pipeline.py
@@ -1192,188 +976,6 @@ def run_pipeline(
         "cache_stats": cache_stats,
         "dp_stats": dp_stats,
     }
-</file>
-
-<file path="run_experiments.py">
-"""
-run_experiments.py
-------------------
-Ejecuta el pipeline (DP + grafo esparcido con poda por embeddings) sobre
-todas las instancias de los datasets disponibles (dataset.json,
-dataset_synthetic.json), variando:
-  - Modelo de embeddings (A / B)
-  - lambda_penalty (penalización estructural por segmento)
-  - embedding_weight (peso de la cohesión de embeddings frente al LLM)
-
-Genera results.csv y muestra tabla resumen.
-
-Nota: cada combinación de hiperparámetros implica una corrida completa
-del DP, con sus propias llamadas al LLM (del orden de 15-30 por
-instancia, según las podas). Si el dataset es grande, usa --quick para
-limitar a 3 instancias por dataset durante pruebas.
-
-Uso:
-    python run_experiments.py
-    python run_experiments.py --quick   # solo 3 instancias por dataset
-"""
-
-import csv
-import json
-import random
-import argparse
-import time
-from pathlib import Path
-
-from embeddings import MODEL_A, MODEL_B
-from pipeline import run_pipeline
-from adaptive_segmentation import compute_f1
-
-DATASETS          = ["dataset.json", "dataset_synthetic.json"]
-LAMBDA_PENALTIES  = [1.0, 3.0, 5.0]
-EMBEDDING_WEIGHT  = 0.3   # fijo; documentar en el informe si se quiere
-                          # barrer también este parámetro
-MIN_COHESION      = 0.5
-MODEL_OPTIONS     = {"MODEL_A": MODEL_A, "MODEL_B": MODEL_B}
-
-FIELDNAMES = [
-    "dataset", "instance_id", "title", "n_sentences", "K_real",
-    "model", "lambda_penalty", "embedding_weight",
-    "K_detected", "F1_tol0", "Precision_tol0", "Recall_tol0",
-    "F1_tol1", "Precision_tol1", "Recall_tol1",
-    "time_sec", "llm_calls", "cache_hit_rate",
-    "edges_total", "edges_pruned_length", "edges_pruned_cohesion", "edges_evaluated_llm",
-    "evaluation_mode", "global_score",
-]
-
-
-def run_all(quick: bool = False) -> None:
-    random.seed(42)
-    results = []
-
-    print("=" * 70)
-    print("EJECUCIÓN DE EXPERIMENTOS")
-    print("=" * 70)
-
-    for ds_name in DATASETS:
-        ds_path = Path(ds_name)
-        if not ds_path.exists():
-            print(f"  [!] Dataset {ds_name} no encontrado, se omite.")
-            continue
-
-        with open(ds_path, encoding="utf-8") as f:
-            dataset = json.load(f)
-
-        if quick:
-            dataset = dataset[:3]
-
-        print(f"\nDataset: {ds_name} ({len(dataset)} instancias)")
-
-        for idx, instance in enumerate(dataset):
-            sentences = instance["sentences"]
-            gt_cuts   = instance.get("ground_truth_cuts", [])
-            title     = instance.get("title", f"instancia_{idx}")
-            n         = instance["n_sentences"]
-            K_real    = instance["K"]
-
-            for model_name, model_path in MODEL_OPTIONS.items():
-                if not Path(model_path).exists():
-                    print(f"  [!] Modelo {model_name} no encontrado, se omite.")
-                    continue
-
-                for lp in LAMBDA_PENALTIES:
-                    tag = f"{model_name} | lambda={lp}"
-                    print(f"  [{idx+1}/{len(dataset)}] {title[:40]} | {tag} ...", end=" ", flush=True)
-
-                    t0 = time.time()
-                    try:
-                        res = run_pipeline(
-                            sentences,
-                            model_path       = model_path,
-                            min_seg          = 3,
-                            lambda_penalty   = lp,
-                            min_cohesion     = MIN_COHESION,
-                            embedding_weight = EMBEDDING_WEIGHT,
-                        )
-                    except Exception as e:
-                        print(f"ERROR: {e}")
-                        continue
-
-                    elapsed  = time.time() - t0
-                    f1_0, p0, r0 = compute_f1(res["best_cuts"], gt_cuts, tolerance=0)
-                    f1_1, p1, r1 = compute_f1(res["best_cuts"], gt_cuts, tolerance=1)
-                    calls    = res.get("total_llm_calls", 0)
-                    hit_rate = res.get("cache_stats", {}).get("hit_rate", 0.0)
-                    dp_stats = res.get("dp_stats", {})
-
-                    results.append({
-                        "dataset":               ds_name,
-                        "instance_id":           idx,
-                        "title":                 title,
-                        "n_sentences":           n,
-                        "K_real":                K_real,
-                        "model":                 model_name,
-                        "lambda_penalty":        lp,
-                        "embedding_weight":      EMBEDDING_WEIGHT,
-                        "K_detected":            res["best_K"],
-                        "F1_tol0":               f1_0,
-                        "Precision_tol0":        p0,
-                        "Recall_tol0":           r0,
-                        "F1_tol1":               f1_1,
-                        "Precision_tol1":        p1,
-                        "Recall_tol1":           r1,
-                        "time_sec":              elapsed,
-                        "llm_calls":             calls,
-                        "cache_hit_rate":        hit_rate,
-                        "edges_total":           dp_stats.get("edges_total", 0),
-                        "edges_pruned_length":   dp_stats.get("edges_pruned_length", 0),
-                        "edges_pruned_cohesion": dp_stats.get("edges_pruned_cohesion", 0),
-                        "edges_evaluated_llm":   dp_stats.get("edges_evaluated_llm", 0),
-                        "evaluation_mode":       dp_stats.get("evaluation_mode"),
-                        "global_score":          dp_stats.get("global_score"),
-                    })
-                    print(f"K={res['best_K']} F1={f1_0:.3f} ({elapsed:.1f}s)")
-
-    # Exportar CSV
-    csv_path = "results.csv"
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"\nResultados guardados en: {csv_path}")
-
-    # Tabla resumen
-    if not results:
-        print("Sin resultados para mostrar.")
-        return
-
-    print("\n" + "=" * 90)
-    print("RESUMEN POR CONFIGURACIÓN (promedios)")
-    print("=" * 90)
-    print(f"{'Modelo':<10} {'lambda':<8} {'N':<5} "
-          f"{'F1(tol0)':<9} {'F1(tol1)':<9} {'t(s)':<7} {'LLM':<6} {'PodCoh':<7}")
-    print("-" * 90)
-
-    groups: dict = {}
-    for r in results:
-        key = (r["model"], r["lambda_penalty"])
-        groups.setdefault(key, []).append(r)
-
-    for (model, lp), items in sorted(groups.items()):
-        avg_f1_0  = sum(it["F1_tol0"]   for it in items) / len(items)
-        avg_f1_1  = sum(it["F1_tol1"]   for it in items) / len(items)
-        avg_t     = sum(it["time_sec"]  for it in items) / len(items)
-        avg_calls = sum(it["llm_calls"] for it in items) / len(items)
-        avg_pruned_coh = sum(it["edges_pruned_cohesion"] for it in items) / len(items)
-        print(f"{model:<10} {lp:<8.1f} {len(items):<5} "
-              f"{avg_f1_0:<9.3f} {avg_f1_1:<9.3f} {avg_t:<7.1f} {avg_calls:<6.0f} {avg_pruned_coh:<7.1f}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true",
-                        help="Ejecutar solo 3 instancias por dataset (para pruebas)")
-    args = parser.parse_args()
-    run_all(quick=args.quick)
 </file>
 
 <file path="simulated_annealing.py">
@@ -1947,6 +1549,222 @@ if __name__ == "__main__":
     print("Recall ≥ 80% es el objetivo mínimo para la Fase 1.")
 </file>
 
+<file path="dp_segmentation.py">
+"""
+dp_segmentation.py
+------------------
+Segmentación Multiescala Adaptativa con búsqueda binaria guiada por LLM.
+
+Arquitectura:
+  1. Se evalúa el segmento completo con el LLM (dos fases en llm_evaluator).
+  2. Si score >= score_threshold → segmento cohesivo → NO recursionar.
+     El segmento se acepta tal cual, sin buscar subcortes.
+  3. Si score < score_threshold → segmento mezclado → recursionar:
+     a. Se busca el valle más profundo (embeddings) dentro del rango.
+     b. Se divide el segmento en dos mitades por ese valle.
+     c. Se repite el proceso en cada mitad de forma independiente.
+
+Ventajas de esta búsqueda binaria guiada:
+  - Los segmentos cohesivos NO generan llamadas adicionales al LLM.
+  - Solo los segmentos mezclados se subdividen, reduciendo llamadas totales.
+  - El umbral score_threshold controla la agresividad de la segmentación.
+
+Integración con llm_evaluator (dos fases):
+  - Fase 1 (prompt suave): detecta casos claros (muy mezclado / muy cohesivo).
+  - Fase 2 (prompt estricto): se activa solo si Fase 1 da score alto,
+    buscando subtemas ocultos. El score final es min(suave, estricto).
+  - Si score_final >= score_threshold → cohesivo → parar recursión.
+  - Si score_final < score_threshold → mezclado → buscar corte y dividir.
+"""
+
+from __future__ import annotations
+import numpy as np
+from embeddings import cosine_similarity, compute_similarity_profile, find_local_valleys
+from llm_evaluator import evaluate_segment, select_evaluation_mode, GLOBAL_SCORE_THRESHOLD
+
+
+def _find_best_valley_in_range(
+    valley_cuts: list[tuple[int, float]],
+    embeddings: np.ndarray,
+    start: int,
+    end: int,
+    min_seg: int,
+) -> int:
+    """
+    Encuentra el mejor punto de corte dentro de [start, end).
+
+    Estrategia:
+      1. Buscar en los valles globales precomputados (más eficiente).
+      2. Si ningún valle global cae en el rango (común en sub-rangos
+         pequeños tras varios niveles de recursión), hacer búsqueda local
+         del mínimo de similitud coseno como fallback.
+
+    Retorna la posición del mejor corte, o -1 si no es posible cortar
+    respetando min_seg.
+    """
+    # 1. Valles globales ordenados por profundidad (descendente)
+    for pos, _depth in valley_cuts:
+        if start + min_seg <= pos <= end - min_seg:
+            return pos
+
+    # 2. Fallback: mínimo local de similitud coseno en el rango
+    best_cut = -1
+    min_sim  = float('inf')
+    for i in range(start + min_seg, end - min_seg + 1):
+        sim = cosine_similarity(embeddings[i - 1], embeddings[i])
+        if sim < min_sim:
+            min_sim  = sim
+            best_cut = i
+
+    return best_cut
+
+
+def _recursive_segment(
+    sentences: list[str],
+    embeddings: np.ndarray,
+    start: int,
+    end: int,
+    min_seg: int,
+    score_threshold: float,
+    valley_cuts: list[tuple[int, float]],
+    stats: dict,
+    depth: int = 0,
+) -> list[int]:
+    """
+    Segmentación recursiva (búsqueda binaria guiada por LLM).
+
+    Para cada bloque [start, end):
+      1. Evaluar cohesión con LLM (dos fases).
+      2. Si score >= score_threshold → cohesivo → devolver [] (sin cortes).
+      3. Si score < score_threshold → mezclado:
+         a. Encontrar el mejor valle en el rango.
+         b. Dividir en [start, cut) y [cut, end).
+         c. Recursionar en cada mitad.
+
+    Parámetros:
+      depth : nivel de recursión (para logging con indentación)
+    """
+    indent = "  " * (depth + 1)
+
+    # Condición de parada: bloque demasiado pequeño para dividir
+    if (end - start) < (min_seg * 2):
+        print(f"{indent}[Recursión] Bloque [{start},{end}) demasiado pequeño → parar")
+        return []
+
+    stats["edges_evaluated_llm"] += 1
+    score = evaluate_segment(sentences, start, end)
+
+    if score >= score_threshold:
+        # Segmento cohesivo: NO recursionar, NO buscar subcortes
+        print(f"{indent}[Recursión] [{start},{end}) cohesivo (score={score:.1f}) → aceptar sin cortes")
+        return []
+
+    # Segmento mezclado: buscar el mejor corte y dividir
+    print(f"{indent}[Recursión] [{start},{end}) mezclado (score={score:.1f}) → buscando corte...")
+    best_cut = _find_best_valley_in_range(valley_cuts, embeddings, start, end, min_seg)
+
+    if best_cut == -1:
+        print(f"{indent}[Recursión] No se encontró corte válido en [{start},{end}) → parar")
+        return []
+
+    print(f"{indent}[Recursión] Corte en posición {best_cut} → dividiendo [{start},{best_cut}) y [{best_cut},{end})")
+
+    cuts_left  = _recursive_segment(sentences, embeddings, start,    best_cut, min_seg, score_threshold, valley_cuts, stats, depth + 1)
+    cuts_right = _recursive_segment(sentences, embeddings, best_cut, end,      min_seg, score_threshold, valley_cuts, stats, depth + 1)
+
+    return sorted(set(cuts_left + [best_cut] + cuts_right))
+
+
+def run_dp_segmentation(
+  sentences: list[str],
+  embeddings: np.ndarray,
+  min_seg: int = 3,
+  **kwargs,
+) -> tuple[list[int], dict]:
+  """
+  Función principal del motor de segmentación.
+
+  Flujo:
+    0. Evaluación Inicial: select_evaluation_mode() puntúa la calidad/
+     coherencia global del texto (0-10) y fija el modo de prompt
+     ("strict" si score_global >= GLOBAL_SCORE_THRESHOLD, "soft" en
+     caso contrario) para TODA la ejecución.
+    1. Precomputar perfil de similitud y valles globales (una sola vez).
+    2. Evaluar el texto completo con el LLM, usando el modo ya fijado.
+    3. Si cohesivo (score >= score_threshold) → devolver sin cortes.
+     Si mezclado → iniciar recursión con búsqueda binaria guiada,
+     donde TODOS los subsegmentos se evalúan con el mismo modo.
+
+  Parámetros kwargs:
+    score_threshold : umbral de cohesión para parar la recursión
+            (default 7.0). Es independiente de
+            GLOBAL_SCORE_THRESHOLD (que decide el modo de
+            prompt); score_threshold decide cuándo dejar de
+            dividir un bloque.
+
+  Retorna:
+    (cortes_finales, estadísticas)
+  """
+  n               = len(sentences)
+  score_threshold = kwargs.get("score_threshold", 7.0)
+
+  stats = {
+    "edges_evaluated_llm":   0,
+    "edges_total":           0,
+    "edges_pruned_length":   0,
+    "edges_pruned_cohesion": 0,
+    "evaluation_mode":       None,
+    "global_score":          None,
+  }
+
+  # 0. Evaluación Inicial: decide el modo de prompt para toda la ejecución
+  mode, global_score = select_evaluation_mode(sentences)
+  stats["evaluation_mode"] = mode
+  stats["global_score"]    = global_score
+  stats["edges_evaluated_llm"] += 1
+  print(f"  [DP] Escenario {'A (estricto)' if mode == 'strict' else 'B (suave)'}: "
+      f"score_global={global_score:.1f} (umbral={GLOBAL_SCORE_THRESHOLD}) → modo='{mode}'")
+
+  # 1. Precomputar valles globales UNA SOLA VEZ
+  similarities = compute_similarity_profile(embeddings)
+  raw_valleys  = find_local_valleys(similarities)
+  valley_cuts  = [(idx + 1, depth) for idx, depth in raw_valleys]
+
+  print(f"  [DP] Valles precomputados (por profundidad): "
+      f"{[pos for pos, _ in valley_cuts]}")
+  print(f"  [DP] score_threshold={score_threshold} | min_seg={min_seg}")
+
+  # 2. Evaluación inicial del texto completo, con el modo ya fijado
+  stats["edges_evaluated_llm"] += 1
+  score_total = evaluate_segment(sentences, 0, n)
+
+  if score_total >= score_threshold:
+    print(f"  [DP] Texto completo cohesivo (score={score_total:.1f}) → sin cortes")
+    stats["edges_total"] = stats["edges_evaluated_llm"]
+    return [], stats
+
+  # 3. Texto mezclado → recursión con búsqueda binaria, modo consistente
+  print(f"  [DP] Texto mezclado (score={score_total:.1f}) → iniciando segmentación recursiva...")
+  final_cuts = _recursive_segment(
+    sentences       = sentences,
+    embeddings      = embeddings,
+    start           = 0,
+    end             = n,
+    min_seg         = min_seg,
+    score_threshold = score_threshold,
+    valley_cuts     = valley_cuts,
+    stats           = stats,
+    depth           = 0,
+  )
+
+  stats["edges_total"] = stats["edges_evaluated_llm"]
+
+  print(f"  [DP] Segmentación completada. Cortes: {final_cuts} "
+      f"| LLM calls: {stats['edges_evaluated_llm']} | modo='{mode}'")
+
+  return sorted(set(final_cuts)), stats
+</file>
+
 <file path="embeddings.py">
 """
 embeddings.py
@@ -2125,6 +1943,188 @@ requests
 wikipedia-api
 python-dotenv
 cerebras-cloud-sdk
+</file>
+
+<file path="run_experiments.py">
+"""
+run_experiments.py
+------------------
+Ejecuta el pipeline (DP + grafo esparcido con poda por embeddings) sobre
+todas las instancias de los datasets disponibles (dataset.json,
+dataset_synthetic.json), variando:
+  - Modelo de embeddings (A / B)
+  - lambda_penalty (penalización estructural por segmento)
+  - embedding_weight (peso de la cohesión de embeddings frente al LLM)
+
+Genera results.csv y muestra tabla resumen.
+
+Nota: cada combinación de hiperparámetros implica una corrida completa
+del DP, con sus propias llamadas al LLM (del orden de 15-30 por
+instancia, según las podas). Si el dataset es grande, usa --quick para
+limitar a 3 instancias por dataset durante pruebas.
+
+Uso:
+    python run_experiments.py
+    python run_experiments.py --quick   # solo 3 instancias por dataset
+"""
+
+import csv
+import json
+import random
+import argparse
+import time
+from pathlib import Path
+
+from embeddings import MODEL_A, MODEL_B
+from pipeline import run_pipeline
+from adaptive_segmentation import compute_f1
+
+DATASETS          = ["dataset.json", "dataset_synthetic.json"]
+LAMBDA_PENALTIES  = [1.0, 3.0, 5.0]
+EMBEDDING_WEIGHT  = 0.3   # fijo; documentar en el informe si se quiere
+                          # barrer también este parámetro
+MIN_COHESION      = 0.5
+MODEL_OPTIONS     = {"MODEL_A": MODEL_A, "MODEL_B": MODEL_B}
+
+FIELDNAMES = [
+    "dataset", "instance_id", "title", "n_sentences", "K_real",
+    "model", "lambda_penalty", "embedding_weight",
+    "K_detected", "F1_tol0", "Precision_tol0", "Recall_tol0",
+    "F1_tol1", "Precision_tol1", "Recall_tol1",
+    "time_sec", "llm_calls", "cache_hit_rate",
+    "edges_total", "edges_pruned_length", "edges_pruned_cohesion", "edges_evaluated_llm",
+    "evaluation_mode", "global_score",
+]
+
+
+def run_all(quick: bool = False) -> None:
+    random.seed(42)
+    results = []
+
+    print("=" * 70)
+    print("EJECUCIÓN DE EXPERIMENTOS")
+    print("=" * 70)
+
+    for ds_name in DATASETS:
+        ds_path = Path(ds_name)
+        if not ds_path.exists():
+            print(f"  [!] Dataset {ds_name} no encontrado, se omite.")
+            continue
+
+        with open(ds_path, encoding="utf-8") as f:
+            dataset = json.load(f)
+
+        if quick:
+            dataset = dataset[:3]
+
+        print(f"\nDataset: {ds_name} ({len(dataset)} instancias)")
+
+        for idx, instance in enumerate(dataset):
+            sentences = instance["sentences"]
+            gt_cuts   = instance.get("ground_truth_cuts", [])
+            title     = instance.get("title", f"instancia_{idx}")
+            n         = instance["n_sentences"]
+            K_real    = instance["K"]
+
+            for model_name, model_path in MODEL_OPTIONS.items():
+                if not Path(model_path).exists():
+                    print(f"  [!] Modelo {model_name} no encontrado, se omite.")
+                    continue
+
+                for lp in LAMBDA_PENALTIES:
+                    tag = f"{model_name} | lambda={lp}"
+                    print(f"  [{idx+1}/{len(dataset)}] {title[:40]} | {tag} ...", end=" ", flush=True)
+
+                    t0 = time.time()
+                    try:
+                        res = run_pipeline(
+                            sentences,
+                            model_path       = model_path,
+                            min_seg          = 3,
+                            lambda_penalty   = lp,
+                            min_cohesion     = MIN_COHESION,
+                            embedding_weight = EMBEDDING_WEIGHT,
+                        )
+                    except Exception as e:
+                        print(f"ERROR: {e}")
+                        continue
+
+                    elapsed  = time.time() - t0
+                    f1_0, p0, r0 = compute_f1(res["best_cuts"], gt_cuts, tolerance=0)
+                    f1_1, p1, r1 = compute_f1(res["best_cuts"], gt_cuts, tolerance=1)
+                    calls    = res.get("total_llm_calls", 0)
+                    hit_rate = res.get("cache_stats", {}).get("hit_rate", 0.0)
+                    dp_stats = res.get("dp_stats", {})
+
+                    results.append({
+                        "dataset":               ds_name,
+                        "instance_id":           idx,
+                        "title":                 title,
+                        "n_sentences":           n,
+                        "K_real":                K_real,
+                        "model":                 model_name,
+                        "lambda_penalty":        lp,
+                        "embedding_weight":      EMBEDDING_WEIGHT,
+                        "K_detected":            res["best_K"],
+                        "F1_tol0":               f1_0,
+                        "Precision_tol0":        p0,
+                        "Recall_tol0":           r0,
+                        "F1_tol1":               f1_1,
+                        "Precision_tol1":        p1,
+                        "Recall_tol1":           r1,
+                        "time_sec":              elapsed,
+                        "llm_calls":             calls,
+                        "cache_hit_rate":        hit_rate,
+                        "edges_total":           dp_stats.get("edges_total", 0),
+                        "edges_pruned_length":   dp_stats.get("edges_pruned_length", 0),
+                        "edges_pruned_cohesion": dp_stats.get("edges_pruned_cohesion", 0),
+                        "edges_evaluated_llm":   dp_stats.get("edges_evaluated_llm", 0),
+                        "evaluation_mode":       dp_stats.get("evaluation_mode"),
+                        "global_score":          dp_stats.get("global_score"),
+                    })
+                    print(f"K={res['best_K']} F1={f1_0:.3f} ({elapsed:.1f}s)")
+
+    # Exportar CSV
+    csv_path = "results.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"\nResultados guardados en: {csv_path}")
+
+    # Tabla resumen
+    if not results:
+        print("Sin resultados para mostrar.")
+        return
+
+    print("\n" + "=" * 90)
+    print("RESUMEN POR CONFIGURACIÓN (promedios)")
+    print("=" * 90)
+    print(f"{'Modelo':<10} {'lambda':<8} {'N':<5} "
+          f"{'F1(tol0)':<9} {'F1(tol1)':<9} {'t(s)':<7} {'LLM':<6} {'PodCoh':<7}")
+    print("-" * 90)
+
+    groups: dict = {}
+    for r in results:
+        key = (r["model"], r["lambda_penalty"])
+        groups.setdefault(key, []).append(r)
+
+    for (model, lp), items in sorted(groups.items()):
+        avg_f1_0  = sum(it["F1_tol0"]   for it in items) / len(items)
+        avg_f1_1  = sum(it["F1_tol1"]   for it in items) / len(items)
+        avg_t     = sum(it["time_sec"]  for it in items) / len(items)
+        avg_calls = sum(it["llm_calls"] for it in items) / len(items)
+        avg_pruned_coh = sum(it["edges_pruned_cohesion"] for it in items) / len(items)
+        print(f"{model:<10} {lp:<8.1f} {len(items):<5} "
+              f"{avg_f1_0:<9.3f} {avg_f1_1:<9.3f} {avg_t:<7.1f} {avg_calls:<6.0f} {avg_pruned_coh:<7.1f}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--quick", action="store_true",
+                        help="Ejecutar solo 3 instancias por dataset (para pruebas)")
+    args = parser.parse_args()
+    run_all(quick=args.quick)
 </file>
 
 <file path="adaptive_segmentation.py">
@@ -2378,12 +2378,12 @@ _global_score: float | None = None
 
 # Prompt Suave: enfocado en flexibilidad, permite inferencias ligeras
 # cuando la estructura no es obvia.
-PROMPT_SOFT = """Analyze the following text and rate its thematic coherence from 1 to 10.
+PROMPT_SOFT = """Analyze the following text and rate its broader thematic coherence from 1 to 10.
 
-- 1-3: The text mixes completely unrelated topics (e.g., biology + Roman history + astronomy in the same paragraph).
-- 4-6: The text has a general theme but includes noticeable digressions or shifts in focus.
-- 7-9: The text is mostly about one topic, with minor transitions or elaborations.
-- 10: The text is perfectly homogeneous — all sentences describe the exact same concept or process without any shift.
+- 1-3: The text abruptly mixes completely different major categories (e.g., History of a discovery mixed with detailed chemical equations, or astronomy mixed with biology).
+- 4-6: The text has a general theme but includes noticeable structural shifts (e.g., finishing a historical intro and starting a technical deep-dive).
+- 7-9: The text is mostly about one overarching topic, even if it progresses naturally through related sub-points or a timeline.
+- 10: The text is perfectly cohesive and belongs to a single logical block.
 
 Text:
 {texto}
@@ -2391,26 +2391,23 @@ Text:
 Put your reasoning inside <think></think> tags. Output your final score exactly as: [SCORE: X.X]"""
 
 
-# Prompt Estricto: enfocado en reglas rígidas, límites sintácticos
-# precisos y nula tolerancia a interpretaciones ambiguas.
-PROMPT_STRICT = """You are a ruthless text segmentation algorithm. Your job is to find reasons to CUT this text.
+# Prompt Estricto: Diferencia entre flujo narrativo y saltos de sub-procesos.
+PROMPT_STRICT = """You are an advanced text segmentation algorithm. Your job is to detect SHIFTS in specific sub-topics to determine if a text should be CUT.
 
-Evaluate strictly:
-- Does the text TRANSITION between different sub-topics? (e.g., from a general theory to a specific experiment, from one historical period to another, from one author to another)
-- Does the focus SHIFT even slightly? (e.g., from macroscopic biology to molecular chemistry)
-- Are there sentences that would more naturally belong to a DIFFERENT section?
+Evaluate the text focusing on functional and thematic boundaries:
+1. Distinguish chronological flow from topic shifts: A timeline of scientists making discoveries about the SAME concept is ONE cohesive topic. Do not cut just because the name or year changes.
+2. Beware of jargon repetition: Just because technical words (e.g., 'electrons', 'ATP', 'light') repeat, does not mean it is a single topic. If the text shifts from describing 'Structure' to 'Process A' to 'Process B', these are different sub-topics and MUST be cut.
+3. Look for abrupt category changes (e.g., jumping from History to Cellular Anatomy).
 
 Rules:
-- Score 9.0-10.0 ONLY if the text is 100% homogeneous with zero thematic shift.
-- Score 5.0-8.0 if there is a subtle but detectable shift in focus or sub-topic.
-- Score 1.0-4.0 if there is a clear transition between different sub-topics.
+- Score 9.0-10.0 ONLY if the text discusses a SINGLE specific sub-topic or represents a continuous, unbroken narrative (like a single historical timeline).
+- Score 5.0-8.0 if there is a subtle shift to a new sub-process or structural category.
+- Score 1.0-4.0 if there is a clear boundary (e.g., History ends, Anatomy begins; or Process A ends, Process B begins).
 
 Text:
 {texto}
 
 Put your reasoning inside <think></think> tags. Output your final decision exactly as: [SCORE: X.X]"""
-
-
 # ---------------------------------------------------------------------------
 # Llamada a la API de Cerebras
 # ---------------------------------------------------------------------------

@@ -1,213 +1,162 @@
 """
 dp_segmentation.py
 ------------------
-Segmentación Multiescala Adaptativa con búsqueda binaria guiada por LLM.
-
-Arquitectura:
-  1. Se evalúa el segmento completo con el LLM (dos fases en llm_evaluator).
-  2. Si score >= score_threshold → segmento cohesivo → NO recursionar.
-     El segmento se acepta tal cual, sin buscar subcortes.
-  3. Si score < score_threshold → segmento mezclado → recursionar:
-     a. Se busca el valle más profundo (embeddings) dentro del rango.
-     b. Se divide el segmento en dos mitades por ese valle.
-     c. Se repite el proceso en cada mitad de forma independiente.
-
-Ventajas de esta búsqueda binaria guiada:
-  - Los segmentos cohesivos NO generan llamadas adicionales al LLM.
-  - Solo los segmentos mezclados se subdividen, reduciendo llamadas totales.
-  - El umbral score_threshold controla la agresividad de la segmentación.
-
-Integración con llm_evaluator (dos fases):
-  - Fase 1 (prompt suave): detecta casos claros (muy mezclado / muy cohesivo).
-  - Fase 2 (prompt estricto): se activa solo si Fase 1 da score alto,
-    buscando subtemas ocultos. El score final es min(suave, estricto).
-  - Si score_final >= score_threshold → cohesivo → parar recursión.
-  - Si score_final < score_threshold → mezclado → buscar corte y dividir.
+Segmentación Óptima mediante Grafo Esparcido (Sparse DAG) y Ecuación de Bellman.
+Incluye la "Poda de Solapamiento Temático" para eliminar llamadas redundantes al LLM.
 """
 
 from __future__ import annotations
 import numpy as np
+
 from embeddings import cosine_similarity, compute_similarity_profile, find_local_valleys
-from llm_evaluator import evaluate_segment, select_evaluation_mode, GLOBAL_SCORE_THRESHOLD
+from llm_evaluator import evaluate_segment, select_evaluation_mode
 
-
-def _find_best_valley_in_range(
-    valley_cuts: list[tuple[int, float]],
-    embeddings: np.ndarray,
-    start: int,
-    end: int,
-    min_seg: int,
-) -> int:
-    """
-    Encuentra el mejor punto de corte dentro de [start, end).
-
-    Estrategia:
-      1. Buscar en los valles globales precomputados (más eficiente).
-      2. Si ningún valle global cae en el rango (común en sub-rangos
-         pequeños tras varios niveles de recursión), hacer búsqueda local
-         del mínimo de similitud coseno como fallback.
-
-    Retorna la posición del mejor corte, o -1 si no es posible cortar
-    respetando min_seg.
-    """
-    # 1. Valles globales ordenados por profundidad (descendente)
-    for pos, _depth in valley_cuts:
-        if start + min_seg <= pos <= end - min_seg:
-            return pos
-
-    # 2. Fallback: mínimo local de similitud coseno en el rango
-    best_cut = -1
-    min_sim  = float('inf')
-    for i in range(start + min_seg, end - min_seg + 1):
-        sim = cosine_similarity(embeddings[i - 1], embeddings[i])
-        if sim < min_sim:
-            min_sim  = sim
-            best_cut = i
-
-    return best_cut
-
-
-def _recursive_segment(
-    sentences: list[str],
-    embeddings: np.ndarray,
-    start: int,
-    end: int,
-    min_seg: int,
-    score_threshold: float,
-    valley_cuts: list[tuple[int, float]],
-    stats: dict,
-    depth: int = 0,
-) -> list[int]:
-    """
-    Segmentación recursiva (búsqueda binaria guiada por LLM).
-
-    Para cada bloque [start, end):
-      1. Evaluar cohesión con LLM (dos fases).
-      2. Si score >= score_threshold → cohesivo → devolver [] (sin cortes).
-      3. Si score < score_threshold → mezclado:
-         a. Encontrar el mejor valle en el rango.
-         b. Dividir en [start, cut) y [cut, end).
-         c. Recursionar en cada mitad.
-
-    Parámetros:
-      depth : nivel de recursión (para logging con indentación)
-    """
-    indent = "  " * (depth + 1)
-
-    # Condición de parada: bloque demasiado pequeño para dividir
-    if (end - start) < (min_seg * 2):
-        print(f"{indent}[Recursión] Bloque [{start},{end}) demasiado pequeño → parar")
-        return []
-
-    stats["edges_evaluated_llm"] += 1
-    score = evaluate_segment(sentences, start, end)
-
-    if score >= score_threshold:
-        # Segmento cohesivo: NO recursionar, NO buscar subcortes
-        print(f"{indent}[Recursión] [{start},{end}) cohesivo (score={score:.1f}) → aceptar sin cortes")
-        return []
-
-    # Segmento mezclado: buscar el mejor corte y dividir
-    print(f"{indent}[Recursión] [{start},{end}) mezclado (score={score:.1f}) → buscando corte...")
-    best_cut = _find_best_valley_in_range(valley_cuts, embeddings, start, end, min_seg)
-
-    if best_cut == -1:
-        print(f"{indent}[Recursión] No se encontró corte válido en [{start},{end}) → parar")
-        return []
-
-    print(f"{indent}[Recursión] Corte en posición {best_cut} → dividiendo [{start},{best_cut}) y [{best_cut},{end})")
-
-    cuts_left  = _recursive_segment(sentences, embeddings, start,    best_cut, min_seg, score_threshold, valley_cuts, stats, depth + 1)
-    cuts_right = _recursive_segment(sentences, embeddings, best_cut, end,      min_seg, score_threshold, valley_cuts, stats, depth + 1)
-
-    return sorted(set(cuts_left + [best_cut] + cuts_right))
-
+def _fast_segment_cohesion(embeddings: np.ndarray, start: int, end: int) -> float:
+    """Calcula rápidamente la cohesión base usando el centroide de los embeddings."""
+    seg = embeddings[start:end]
+    if len(seg) < 2:
+        return 1.0
+    centroid = seg.mean(axis=0)
+    sims = [cosine_similarity(emb, centroid) for emb in seg]
+    return float(np.mean(sims))
 
 def run_dp_segmentation(
-  sentences: list[str],
-  embeddings: np.ndarray,
-  min_seg: int = 3,
-  **kwargs,
+    sentences: list[str],
+    embeddings: np.ndarray,
+    min_seg: int = 3,
+    lambda_penalty: float = 3.0,
+    max_seg_len: int | None = None,
+    min_cohesion: float = 0.5,
+    **kwargs
 ) -> tuple[list[int], dict]:
-  """
-  Función principal del motor de segmentación.
+    n = len(sentences)
+    
+    if max_seg_len is None:
+        max_seg_len = max(min_seg * 5, n // 2)
 
-  Flujo:
-    0. Evaluación Inicial: select_evaluation_mode() puntúa la calidad/
-     coherencia global del texto (0-10) y fija el modo de prompt
-     ("strict" si score_global >= GLOBAL_SCORE_THRESHOLD, "soft" en
-     caso contrario) para TODA la ejecución.
-    1. Precomputar perfil de similitud y valles globales (una sola vez).
-    2. Evaluar el texto completo con el LLM, usando el modo ya fijado.
-    3. Si cohesivo (score >= score_threshold) → devolver sin cortes.
-     Si mezclado → iniciar recursión con búsqueda binaria guiada,
-     donde TODOS los subsegmentos se evalúan con el mismo modo.
+    stats = {
+        "edges_evaluated_llm": 0,
+        "edges_total": 0,
+        "edges_pruned_length": 0,
+        "edges_pruned_cohesion": 0,
+        "edges_pruned_math": 0,
+        "edges_pruned_theme": 0,
+        "edges_pruned_overlap": 0,  # NUEVA MÉTRICA: Poda inteligente
+        "evaluation_mode": None,
+        "global_score": None
+    }
 
-  Parámetros kwargs:
-    score_threshold : umbral de cohesión para parar la recursión
-            (default 7.0). Es independiente de
-            GLOBAL_SCORE_THRESHOLD (que decide el modo de
-            prompt); score_threshold decide cuándo dejar de
-            dividir un bloque.
+    # 1. Modo de evaluación global
+    mode, global_score = select_evaluation_mode(sentences)
+    stats["evaluation_mode"] = mode
+    stats["global_score"] = global_score
 
-  Retorna:
-    (cortes_finales, estadísticas)
-  """
-  n               = len(sentences)
-  score_threshold = kwargs.get("score_threshold", 7.0)
+    # 2. Generar Nodos
+    similarities = compute_similarity_profile(embeddings)
+    raw_valleys = find_local_valleys(similarities)
+    valid_cuts = {idx + 1 for idx, depth in raw_valleys}
+    nodes = sorted(list({0, n} | valid_cuts))
+    
+    print(f"  [DP] Construyendo Sparse DAG. N={n}, Nodos={len(nodes)}")
 
-  stats = {
-    "edges_evaluated_llm":   0,
-    "edges_total":           0,
-    "edges_pruned_length":   0,
-    "edges_pruned_cohesion": 0,
-    "evaluation_mode":       None,
-    "global_score":          None,
-  }
+    # 3. Inicializar DP
+    dp = {node: float('inf') for node in nodes}
+    parent = {node: -1 for node in nodes}
+    dp[0] = 0.0
 
-  # 0. Evaluación Inicial: decide el modo de prompt para toda la ejecución
-  mode, global_score = select_evaluation_mode(sentences)
-  stats["evaluation_mode"] = mode
-  stats["global_score"]    = global_score
-  stats["edges_evaluated_llm"] += 1
-  print(f"  [DP] Escenario {'A (estricto)' if mode == 'strict' else 'B (suave)'}: "
-      f"score_global={global_score:.1f} (umbral={GLOBAL_SCORE_THRESHOLD}) → modo='{mode}'")
+    # Memoria para la Poda de Solapamiento Temático. Guarda tuplas: (inicio_u, fin_cohesivo_w, muro_v)
+    thematic_walls = []
 
-  # 1. Precomputar valles globales UNA SOLA VEZ
-  similarities = compute_similarity_profile(embeddings)
-  raw_valleys  = find_local_valleys(similarities)
-  valley_cuts  = [(idx + 1, depth) for idx, depth in raw_valleys]
+    # 4. Construcción y Relajación
+    for i in range(len(nodes)):
+        u = nodes[i]
+        if dp[u] == float('inf'):
+            continue
+            
+        last_cohesive_v = u # Rastrea hasta dónde llegó el tema actual con éxito
 
-  print(f"  [DP] Valles precomputados (por profundidad): "
-      f"{[pos for pos, _ in valley_cuts]}")
-  print(f"  [DP] score_threshold={score_threshold} | min_seg={min_seg}")
+        for j in range(i + 1, len(nodes)):
+            v = nodes[j]
+            length = v - u
+            
+            # Poda de Longitud
+            if length > max_seg_len:
+                stats["edges_pruned_length"] += (len(nodes) - j)
+                break 
+                
+            if length < min_seg and v != n:
+                stats["edges_pruned_length"] += 1
+                continue
 
-  # 2. Evaluación inicial del texto completo, con el modo ya fijado
-  stats["edges_evaluated_llm"] += 1
-  score_total = evaluate_segment(sentences, 0, n)
+            # Poda Matemática (Dijkstra/A*)
+            if dp[u] + lambda_penalty >= dp[v]:
+                stats["edges_pruned_math"] += 1
+                continue
 
-  if score_total >= score_threshold:
-    print(f"  [DP] Texto completo cohesivo (score={score_total:.1f}) → sin cortes")
-    stats["edges_total"] = stats["edges_evaluated_llm"]
-    return [], stats
+            # Poda Rápida por Embeddings
+            coh = _fast_segment_cohesion(embeddings, u, v)
+            if coh < min_cohesion:
+                stats["edges_pruned_cohesion"] += 1
+                continue
 
-  # 3. Texto mezclado → recursión con búsqueda binaria, modo consistente
-  print(f"  [DP] Texto mezclado (score={score_total:.1f}) → iniciando segmentación recursiva...")
-  final_cuts = _recursive_segment(
-    sentences       = sentences,
-    embeddings      = embeddings,
-    start           = 0,
-    end             = n,
-    min_seg         = min_seg,
-    score_threshold = score_threshold,
-    valley_cuts     = valley_cuts,
-    stats           = stats,
-    depth           = 0,
-  )
+            # ==========================================================
+            # NUEVA OPTIMIZACIÓN: PODA DE SOLAPAMIENTO TEMÁTICO
+            # ==========================================================
+            hit_wall = False
+            for (wall_u, wall_w, wall_bad_v) in thematic_walls:
+                # Si nuestro nodo de inicio 'u' está dentro del bloque cohesivo conocido
+                # Y nuestro destino 'v' cruza o alcanza el muro donde se rompe el tema...
+                if wall_u <= u < wall_w and v >= wall_bad_v:
+                    hit_wall = True
+                    break
+            
+            if hit_wall:
+                # Sabemos matemáticamente que será una mezcla de temas.
+                stats["edges_pruned_overlap"] += (len(nodes) - j)
+                break # Rompemos porque cualquier 'v' posterior también cruzará el muro
+            # ==========================================================
 
-  stats["edges_total"] = stats["edges_evaluated_llm"]
+            stats["edges_total"] += 1
+            stats["edges_evaluated_llm"] += 1
+            
+            # Oráculo LLM
+            score = evaluate_segment(sentences, u, v)
 
-  print(f"  [DP] Segmentación completada. Cortes: {final_cuts} "
-      f"| LLM calls: {stats['edges_evaluated_llm']} | modo='{mode}'")
+            # Ecuación de Bellman
+            cost = (10.0 - score) + lambda_penalty
+            if dp[u] + cost < dp[v]:
+                dp[v] = dp[u] + cost
+                parent[v] = u
 
-  return sorted(set(final_cuts)), stats
+            # Registro de cohesión y muros temáticos
+            if score >= 7.0:
+                last_cohesive_v = v # El tema se mantiene fuerte hasta aquí
+                
+            elif score <= 3.5:
+                # Hemos chocado contra un muro de cambio de tema.
+                if last_cohesive_v > u:
+                    # Guardamos la regla: "Cualquier bloque que empiece entre 'u' y 'last_cohesive_v' 
+                    # se estrellará inevitablemente si intenta llegar hasta 'v'".
+                    thematic_walls.append((u, last_cohesive_v, v))
+                
+                stats["edges_pruned_theme"] += (len(nodes) - j - 1)
+                break
+
+    # 5. Backtracking
+    if dp[n] == float('inf'):
+        print("  [DP] ADVERTENCIA: Grafo desconectado. Usando fallback.")
+        return list(range(max_seg_len, n, max_seg_len)), stats
+
+    cuts = []
+    curr = n
+    while curr > 0:
+        p = parent[curr]
+        if p > 0:
+            cuts.append(p)
+        curr = p
+
+    print(f"  [DP] Optimizaciones: {stats['edges_pruned_math']} matemáticas, "
+          f"{stats['edges_pruned_theme']} rupturas, "
+          f"{stats['edges_pruned_overlap']} solapamientos evitados.")
+          
+    return sorted(cuts), stats
