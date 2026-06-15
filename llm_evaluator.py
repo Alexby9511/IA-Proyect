@@ -49,7 +49,7 @@ MODEL            = "gpt-oss-120b"
 MAX_RETRIES      = 3
 RETRY_DELAY_BASE = 2.0
 TIMEOUT          = 60
-MAX_TOKENS       = 1000
+MAX_TOKENS       = 100000
 
 # Umbral de la evaluación inicial (Escenario A vs B).
 # score_global >= GLOBAL_SCORE_THRESHOLD → modo "strict"
@@ -87,22 +87,33 @@ Put your reasoning inside <think></think> tags. Output your final score exactly 
 
 
 # Prompt Estricto: Diferencia entre flujo narrativo y saltos de sub-procesos.
-PROMPT_STRICT = """You are an advanced text segmentation algorithm. Your job is to detect SHIFTS in specific sub-topics to determine if a text should be CUT.
+PROMPT_STRICT = """You are a text segmentation algorithm. Find if there is a sub-topic boundary in the text.
 
-Evaluate the text focusing on functional and thematic boundaries:
-1. Distinguish chronological flow from topic shifts: A timeline of scientists making discoveries about the SAME concept is ONE cohesive topic. Do not cut just because the name or year changes.
-2. Beware of jargon repetition: Just because technical words (e.g., 'electrons', 'ATP', 'light') repeat, does not mean it is a single topic. If the text shifts from describing 'Structure' to 'Process A' to 'Process B', these are different sub-topics and MUST be cut.
-3. Look for abrupt category changes (e.g., jumping from History to Cellular Anatomy).
+A sub-topic boundary means the text changes its NATURE: e.g., from describing a historical discovery process to describing a physical structure, or from one scientific mechanism to a completely different mechanism.
+
+A continuous chronological narrative that mentions many different scientists, years, or experiments is NOT a boundary — it is ONE narrative thread (e.g., "the history of how X was discovered"). Do NOT mark a cut just because a new person or date appears.
+
+Examples of NO boundary (single narrative thread):
+- "Aristotle proposed X. In the 18th century, Priestley discovered Y. Later, Calvin traced Z." (all history of photosynthesis discovery)
+→ Score: 9.5
+
+Examples of YES boundary (true sub-topic change):
+- "The history of photosynthesis discovery. The structure of chloroplasts." (history → anatomy)
+→ Score: 2.0
+- "The light-dependent reactions of photosynthesis. The Calvin cycle." (two different biochemical mechanisms)
+→ Score: 2.0
 
 Rules:
-- Score 9.0-10.0 ONLY if the text discusses a SINGLE specific sub-topic or represents a continuous, unbroken narrative (like a single historical timeline).
-- Score 5.0-8.0 if there is a subtle shift to a new sub-process or structural category.
-- Score 1.0-4.0 if there is a clear boundary (e.g., History ends, Anatomy begins; or Process A ends, Process B begins).
+- Score 9.0-10.0 if the whole text is ONE continuous thread with zero sub-topic change.
+- Score 1.0-4.0 if there is a clear change in the NATURE of the content (true sub-topic boundary).
+- Score 5.0-8.0 ONLY if you are genuinely unsure.
+
+Now analyze this text.
 
 Text:
 {texto}
 
-Put your reasoning inside <think></think> tags. Output your final decision exactly as: [SCORE: X.X]"""
+Put your reasoning inside <think></think> tags. Output your final score exactly as: [SCORE: X.X]"""
 # ---------------------------------------------------------------------------
 # Llamada a la API de Cerebras
 # ---------------------------------------------------------------------------

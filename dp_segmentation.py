@@ -122,8 +122,15 @@ def run_dp_segmentation(
             # Oráculo LLM
             score = evaluate_segment(sentences, u, v)
 
+            # --- Umbral de rechazo estricto ---
+            # Si score < 7.0, el coste es prohibitivo (100.0)
+            # El algoritmo preferirá dividir el texto antes que aceptar segmentos poco cohesivos.
+            if score < 7.0:
+                cost = 100.0
+            else:
+                cost = (10.0 - score) + lambda_penalty
+            
             # Ecuación de Bellman
-            cost = (10.0 - score) + lambda_penalty
             if dp[u] + cost < dp[v]:
                 dp[v] = dp[u] + cost
                 parent[v] = u
